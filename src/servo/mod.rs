@@ -55,6 +55,10 @@ impl InnerWebView {
       None => (
         if let Some(html) = attributes.html {
           html_url(&html)?
+        } else if true {
+          // SPIKE: lib.rs skips with_url for about:blank, so webviews created with
+          // about:blank landed here and tried to open a non-existent examples/demo.html.
+          parse_url("about:blank", "default URL")?
         } else {
           let demo_path = std::env::current_dir()?.join("examples/demo.html");
           Url::from_file_path(&demo_path).map_err(|()| {
@@ -110,6 +114,10 @@ impl InnerWebView {
       None => (
         if let Some(html) = attributes.html {
           html_url(&html)?
+        } else if true {
+          // SPIKE: lib.rs skips with_url for about:blank, so webviews created with
+          // about:blank landed here and tried to open a non-existent examples/demo.html.
+          parse_url("about:blank", "default URL")?
         } else {
           let demo_path = std::env::current_dir()?.join("examples/demo.html");
           Url::from_file_path(&demo_path).map_err(|()| {
