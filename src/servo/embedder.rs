@@ -156,6 +156,11 @@ impl EventLoopWaker for EmbedderWaker {
 struct Delegate {
   window: Option<Rc<Window>>,
   waker: EmbedderWaker,
+  // SPIKE: a navigation issued while the initial (about:blank) load is still in flight can be
+  // lost, so Embedder::load defers it until the first LoadStatus::Complete (or a 2s timeout).
+  initial_load_done: Cell<bool>,
+  pending_url: RefCell<Option<Url>>,
+  created: std::time::Instant,
   frame_ready: Cell<bool>,
   closed: Cell<bool>,
   ipc_handler: Option<Box<dyn Fn(http::Request<String>)>>,
@@ -183,6 +188,12 @@ impl WebViewDelegate for Delegate {
   }
 
   fn notify_load_status_changed(&self, webview: ServoWebView, status: LoadStatus) {
+    eprintln!("[servo-rt] load_status {:?} url={:?} initial_done={}", status, webview.url().map(|u| u.to_string()), self.initial_load_done.get());
+    if matches!(status, LoadStatus::Complete) && !self.initial_load_done.replace(true) {
+      if let Some(url) = self.pending_url.borrow_mut().take() {
+        webview.load(url);
+      }
+    }
     let Some(handler) = &self.on_page_load_handler else {
       return;
     };
@@ -341,7 +352,9 @@ impl RenderingTarget {
         parent_context.resize(non_zero_size(parent_size));
         let bounds = PhysicalBounds::from_rect(bounds.get(), scale_factor);
         physical_bounds.set(bounds);
-        context.resize(bounds.size);
+        // libservo's resize_rendering_context returns early when the context is already
+        // the new size, so do NOT resize `context` first; webview.resize() resizes it.
+        let _ = &context;
         webview.resize(bounds.size);
       }
     }
@@ -376,7 +389,9 @@ impl RenderingTarget {
         current_bounds.set(bounds);
         let bounds = PhysicalBounds::from_rect(bounds, scale_factor.get());
         physical_bounds.set(bounds);
-        context.resize(bounds.size);
+        // libservo's resize_rendering_context returns early when the context is already
+        // the new size, so do NOT resize `context` first; webview.resize() resizes it.
+        let _ = &context;
         webview.resize(bounds.size);
       }
     }
@@ -638,6 +653,9 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: Some(window.clone()),
       waker: waker.clone(),
+      initial_load_done: Cell::new(false),
+      pending_url: RefCell::new(None),
+      created: std::time::Instant::now(),
       frame_ready: Cell::new(false),
       closed: Cell::new(false),
       ipc_handler,
@@ -719,6 +737,9 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: None,
       waker: waker.clone(),
+      initial_load_done: Cell::new(false),
+      pending_url: RefCell::new(None),
+      created: std::time::Instant::now(),
       frame_ready: Cell::new(false),
       closed: Cell::new(false),
       ipc_handler,
@@ -880,7 +901,26 @@ impl Embedder {
     })
   }
 
+  /// Navigate, deferring while the initial load is still in flight.
+  pub(crate) fn load(&self, url: Url) {
+    let ready = self.delegate.initial_load_done.get()
+      || self.delegate.created.elapsed() > std::time::Duration::from_secs(2);
+    eprintln!("[servo-rt] Embedder::load url={} ready={} current={:?}", url, ready, self.webview.url().map(|u| u.to_string()));
+    if ready {
+      self.delegate.pending_url.borrow_mut().take();
+      self.webview.load(url);
+    } else {
+      *self.delegate.pending_url.borrow_mut() = Some(url);
+    }
+    self.servo.spin_event_loop();
+  }
+
   pub fn handle_user_event(&self) {
+    if self.delegate.created.elapsed() > std::time::Duration::from_secs(2) {
+      if let Some(url) = self.delegate.pending_url.borrow_mut().take() {
+        self.webview.load(url);
+      }
+    }
     if let Some(text) = self.pending_ime_text.borrow_mut().take() {
       self.commit_ime_text(text);
     }
@@ -1318,6 +1358,9 @@ mod tests {
       waker: EmbedderWaker::new(move || {
         wake_count_.fetch_add(1, Ordering::Relaxed);
       }),
+      initial_load_done: Default::default(),
+      pending_url: Default::default(),
+      created: std::time::Instant::now(),
       frame_ready: Default::default(),
       closed: Default::default(),
       ipc_handler: None,
