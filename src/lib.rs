@@ -3892,7 +3892,9 @@ fn handle_user_message<T: UserEvent>(
             }
           }
           WebviewMessage::Navigate(url) => {
+            eprintln!("[servo-rt] Navigate message url={url}");
             if let Err(e) = webview.load_url(url.as_str()) {
+              eprintln!("[servo-rt] load_url failed: {e}");
               log::error!("failed to navigate to url {}: {}", url, e);
             }
           }

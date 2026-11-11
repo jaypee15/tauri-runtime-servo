@@ -196,6 +196,7 @@ impl WebViewDelegate for Delegate {
   }
 
   fn request_navigation(&self, _webview: ServoWebView, request: NavigationRequest) {
+    eprintln!("[servo-rt] request_navigation url={}", request.url);
     if self
       .navigation_handler
       .as_ref()
@@ -263,10 +264,11 @@ enum RenderingTarget {
     context: Rc<WindowRenderingContext>,
   },
   Child {
+    window_id: tao::window::WindowId,
     parent_context: Rc<WindowRenderingContext>,
     context: Rc<OffscreenRenderingContext>,
     bounds: Cell<Rect>,
-    physical_bounds: Cell<PhysicalBounds>,
+    physical_bounds: Rc<Cell<PhysicalBounds>>,
     scale_factor: Cell<f64>,
   },
 }
@@ -294,32 +296,18 @@ impl RenderingTarget {
     webview.paint();
 
     match self {
-      Self::Window { context, .. } => context.present(),
+      Self::Window { window, context } => {
+        composite_children(window.id(), context);
+        context.present();
+      }
       Self::Child {
+        window_id,
         parent_context,
-        context,
-        physical_bounds,
         ..
       } => {
-        if parent_context.make_current().is_err() {
-          return;
-        }
-        parent_context.prepare_for_rendering();
-
-        if let Some(render_to_parent) = context.render_to_parent_callback() {
-          let bounds = physical_bounds.get();
-          let parent_height = parent_context.size().height as i32;
-          let width = bounds.size.width as i32;
-          let height = bounds.size.height as i32;
-          let target = EuclidRect::new(
-            Point2D::new(
-              bounds.position.x,
-              parent_height - bounds.position.y - height,
-            ),
-            Size2D::new(width, height),
-          );
-          render_to_parent(parent_context.glow_gl_api().as_ref(), target);
-        }
+        // This child rendered into its offscreen buffer. Re-blit every child of the
+        // window (creation order) into the shared window context, then present once.
+        composite_children(*window_id, parent_context);
         parent_context.present();
       }
     }
@@ -347,6 +335,7 @@ impl RenderingTarget {
         bounds,
         physical_bounds,
         scale_factor: current_scale_factor,
+        ..
       } => {
         current_scale_factor.set(scale_factor);
         parent_context.resize(non_zero_size(parent_size));
@@ -542,6 +531,51 @@ thread_local! {
   static SHARED_SERVO: RefCell<Option<Rc<Servo>>> = const { RefCell::new(None) };
 }
 
+// SPIKE: per-window composition. All webviews in one native window share a single
+// window rendering context; children render into offscreen buffers and the window's
+// paint re-blits every child, then presents once (so nobody clobbers anybody).
+struct ChildEntry {
+  context: Rc<OffscreenRenderingContext>,
+  physical_bounds: Rc<Cell<PhysicalBounds>>,
+}
+
+struct WindowComp {
+  #[allow(dead_code)]
+  window: Option<Rc<Window>>,
+  context: Rc<WindowRenderingContext>,
+  children: Vec<ChildEntry>,
+}
+
+thread_local! {
+  static WINDOWS: RefCell<HashMap<tao::window::WindowId, WindowComp>> = RefCell::new(HashMap::new());
+}
+
+fn composite_children(window_id: tao::window::WindowId, parent_context: &WindowRenderingContext) {
+  WINDOWS.with(|windows| {
+    let windows = windows.borrow();
+    let Some(comp) = windows.get(&window_id) else {
+      return;
+    };
+    if parent_context.make_current().is_err() {
+      return;
+    }
+    parent_context.prepare_for_rendering();
+    for child in &comp.children {
+      if let Some(render_to_parent) = child.context.render_to_parent_callback() {
+        let bounds = child.physical_bounds.get();
+        let parent_height = parent_context.size().height as i32;
+        let width = bounds.size.width as i32;
+        let height = bounds.size.height as i32;
+        let target = EuclidRect::new(
+          Point2D::new(bounds.position.x, parent_height - bounds.position.y - height),
+          Size2D::new(width, height),
+        );
+        render_to_parent(parent_context.glow_gl_api().as_ref(), target);
+      }
+    }
+  });
+}
+
 /// Owns a handle to the shared Servo engine, a rendering context, and one webview.
 pub struct Embedder {
   servo: Rc<Servo>,
@@ -581,6 +615,16 @@ impl Embedder {
       )
       .map_err(|error| Error::Servo(format!("failed to create rendering context: {error:?}")))?,
     );
+    WINDOWS.with(|windows| {
+      windows.borrow_mut().insert(
+        window.id(),
+        WindowComp {
+          window: Some(window.clone()),
+          context: context.clone(),
+          children: Vec::new(),
+        },
+      );
+    });
     let wake_proxy = proxy.clone();
     let waker = EmbedderWaker::new(move || {
       if let Err(error) = wake_proxy.send_event(()) {
@@ -627,21 +671,46 @@ impl Embedder {
     document_title_changed_handler: Option<Box<dyn Fn(String)>>,
     on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
   ) -> Result<Self> {
-    let parent_context = Rc::new(
-      WindowRenderingContext::new(
-        parent.display_handle()?,
-        parent.window_handle()?,
-        non_zero_size(parent.inner_size()),
-      )
-      .map_err(|error| {
-        Error::Servo(format!(
-          "failed to create parent rendering context: {error:?}"
-        ))
-      })?,
-    );
+    let window_id = parent.id();
+    let parent_context = WINDOWS.with(|windows| -> Result<Rc<WindowRenderingContext>> {
+      let mut windows = windows.borrow_mut();
+      if let Some(comp) = windows.get(&window_id) {
+        return Ok(comp.context.clone());
+      }
+      let context = Rc::new(
+        WindowRenderingContext::new(
+          parent.display_handle()?,
+          parent.window_handle()?,
+          non_zero_size(parent.inner_size()),
+        )
+        .map_err(|error| {
+          Error::Servo(format!(
+            "failed to create parent rendering context: {error:?}"
+          ))
+        })?,
+      );
+      windows.insert(
+        window_id,
+        WindowComp {
+          window: None,
+          context: context.clone(),
+          children: Vec::new(),
+        },
+      );
+      Ok(context)
+    })?;
     let scale_factor = parent.scale_factor();
-    let physical_bounds = PhysicalBounds::from_rect(bounds, scale_factor);
-    let context = Rc::new(parent_context.offscreen_context(physical_bounds.size));
+    let initial_physical = PhysicalBounds::from_rect(bounds, scale_factor);
+    let context = Rc::new(parent_context.offscreen_context(initial_physical.size));
+    let physical_bounds = Rc::new(Cell::new(initial_physical));
+    WINDOWS.with(|windows| {
+      if let Some(comp) = windows.borrow_mut().get_mut(&window_id) {
+        comp.children.push(ChildEntry {
+          context: context.clone(),
+          physical_bounds: physical_bounds.clone(),
+        });
+      }
+    });
     let waker = EmbedderWaker::new(wake);
     let delegate = Rc::new(Delegate {
       window: None,
@@ -654,10 +723,11 @@ impl Embedder {
       on_page_load_handler,
     });
     let target = RenderingTarget::Child {
+      window_id,
       parent_context,
       context,
       bounds: Cell::new(bounds),
-      physical_bounds: Cell::new(physical_bounds),
+      physical_bounds,
       scale_factor: Cell::new(scale_factor),
     };
     Self::build(
