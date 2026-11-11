@@ -280,6 +280,7 @@ enum RenderingTarget {
     context: Rc<OffscreenRenderingContext>,
     bounds: Cell<Rect>,
     physical_bounds: Rc<Cell<PhysicalBounds>>,
+    visible: Rc<Cell<bool>>,
     scale_factor: Cell<f64>,
   },
 }
@@ -423,8 +424,13 @@ impl RenderingTarget {
         point_in_bounds(position, PhysicalPosition::new(0, 0), size)
       }
       Self::Child {
-        physical_bounds, ..
+        physical_bounds,
+        visible,
+        ..
       } => {
+        if !visible.get() {
+          return None;
+        }
         let bounds = physical_bounds.get();
         point_in_bounds(position, bounds.position, bounds.size)
       }
@@ -552,6 +558,7 @@ thread_local! {
 struct ChildEntry {
   context: Rc<OffscreenRenderingContext>,
   physical_bounds: Rc<Cell<PhysicalBounds>>,
+  visible: Rc<Cell<bool>>,
 }
 
 struct WindowComp {
@@ -575,11 +582,10 @@ fn composite_children(window_id: tao::window::WindowId, parent_context: &WindowR
       return;
     }
     parent_context.prepare_for_rendering();
-    eprintln!("[servo-rt] composite parent_size={:?} children={}", parent_context.size(), comp.children.len());
     for child in &comp.children {
-      let has_cb = child.context.render_to_parent_callback().is_some();
-      let pb = child.physical_bounds.get();
-      eprintln!("[servo-rt]   child pos=({},{}) size={}x{} has_frame_callback={}", pb.position.x, pb.position.y, pb.size.width, pb.size.height, has_cb);
+      if !child.visible.get() {
+        continue;
+      }
       if let Some(render_to_parent) = child.context.render_to_parent_callback() {
         let bounds = child.physical_bounds.get();
         let parent_height = parent_context.size().height as i32;
@@ -607,6 +613,21 @@ pub struct Embedder {
   pending_key_text: RefCell<Option<String>>,
   pending_key_event: Cell<bool>,
   focused: Cell<bool>,
+}
+
+impl Drop for Embedder {
+  fn drop(&mut self) {
+    if let RenderingTarget::Child {
+      window_id, context, ..
+    } = &self.target
+    {
+      let _ = WINDOWS.try_with(|windows| {
+        if let Some(comp) = windows.borrow_mut().get_mut(window_id) {
+          comp.children.retain(|child| !Rc::ptr_eq(&child.context, context));
+        }
+      });
+    }
+  }
 }
 
 impl Embedder {
@@ -725,11 +746,13 @@ impl Embedder {
     let initial_physical = PhysicalBounds::from_rect(bounds, scale_factor);
     let context = Rc::new(parent_context.offscreen_context(initial_physical.size));
     let physical_bounds = Rc::new(Cell::new(initial_physical));
+    let visible = Rc::new(Cell::new(true));
     WINDOWS.with(|windows| {
       if let Some(comp) = windows.borrow_mut().get_mut(&window_id) {
         comp.children.push(ChildEntry {
           context: context.clone(),
           physical_bounds: physical_bounds.clone(),
+          visible: visible.clone(),
         });
       }
     });
@@ -753,6 +776,7 @@ impl Embedder {
       context,
       bounds: Cell::new(bounds),
       physical_bounds,
+      visible,
       scale_factor: Cell::new(scale_factor),
     };
     Self::build(
@@ -1159,10 +1183,14 @@ impl Embedder {
 
   pub(crate) fn set_visible(&self, visible: bool) {
     self.target.set_window_visible(visible);
+    if let RenderingTarget::Child { visible: flag, .. } = &self.target {
+      flag.set(visible);
+    }
     if visible {
       self.webview.show();
       self.delegate.request_repaint();
     } else {
+      self.blur_webview();
       self.webview.hide();
     }
     self.servo.spin_event_loop();
