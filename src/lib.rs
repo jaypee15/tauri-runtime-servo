@@ -3946,6 +3946,7 @@ fn handle_user_message<T: UserEvent>(
           }
           WebviewMessage::SetSize(size) => match webview.bounds() {
             Ok(mut bounds) => {
+              eprintln!("[servo-rt] SetSize webview={} old_bounds={:?} new_size={:?}", webview.id(), bounds, size);
               bounds.size = size;
 
               let scale_factor = window.scale_factor();
@@ -3962,6 +3963,7 @@ fn handle_user_message<T: UserEvent>(
               }
             }
             Err(e) => {
+              eprintln!("[servo-rt] SetSize: failed to get webview bounds: {e}");
               log::error!("failed to get webview bounds: {e}");
             }
           },
@@ -4437,7 +4439,10 @@ fn handle_event_loop<T: UserEvent>(
               .get(&window_id)
               .map(|w| (w.inner.clone(), w.webviews.clone()))
             {
-              let size = size.to_logical::<f32>(window.scale_factor());
+              // SPIKE: tao's Resized size is not reliable on macOS (see WindowEvent parse above);
+              // use the window's actual inner size for rate-based auto-resize.
+              eprintln!("[servo-rt] Resized event size={:?} actual_inner={:?}", size, window.inner_size());
+              let size = window.inner_size().to_logical::<f32>(window.scale_factor());
               for webview in webviews {
                 if let Some(b) = &*webview.bounds.lock().unwrap() {
                   if let Err(e) = webview.set_bounds(Rect {

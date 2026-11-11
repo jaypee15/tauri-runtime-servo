@@ -560,7 +560,11 @@ fn composite_children(window_id: tao::window::WindowId, parent_context: &WindowR
       return;
     }
     parent_context.prepare_for_rendering();
+    eprintln!("[servo-rt] composite parent_size={:?} children={}", parent_context.size(), comp.children.len());
     for child in &comp.children {
+      let has_cb = child.context.render_to_parent_callback().is_some();
+      let pb = child.physical_bounds.get();
+      eprintln!("[servo-rt]   child pos=({},{}) size={}x{} has_frame_callback={}", pb.position.x, pb.position.y, pb.size.width, pb.size.height, has_cb);
       if let Some(render_to_parent) = child.context.render_to_parent_callback() {
         let bounds = child.physical_bounds.get();
         let parent_height = parent_context.size().height as i32;
