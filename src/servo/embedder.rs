@@ -877,8 +877,13 @@ impl Embedder {
       if let Some(existing) = slot.as_ref() {
         return existing.clone();
       }
+      // A panic in one page's thread must not take the whole browser down: with the default
+      // `hard_fail: true` Servo exits the process; with false it shows about:failure instead.
+      let mut opts = servo::Opts::default();
+      opts.hard_fail = false;
       let servo = Rc::new(
         ServoBuilder::default()
+          .opts(opts)
           .preferences(preferences)
           .event_loop_waker(Box::new(waker))
           .protocol_registry(protocol_registry)
