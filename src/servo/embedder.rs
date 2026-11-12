@@ -55,7 +55,10 @@ const IPC_BRIDGE_SCRIPT: &str = r#"
   Object.defineProperty(window, 'ipc', {
     value: Object.freeze({
       postMessage: function(message) {
-        console.debug('__SERVO_IPC__:' + String(message));
+        // The payload goes in as a `%s` argument, never as the format string: the console
+        // treats `%c`, `%s`, `%%` ... in the first argument as directives and would corrupt
+        // anything containing them (the invoke key, percent-encoded URLs).
+        console.debug('__SERVO_IPC__:%s', String(message));
       }
     })
   });
