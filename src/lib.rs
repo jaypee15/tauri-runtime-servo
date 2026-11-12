@@ -188,6 +188,12 @@ pub struct RequestAsyncResponder {
 /// Boxed closure resolving an asynchronous custom protocol request.
 pub(crate) type AsyncResponderFn = Box<dyn FnOnce(Response<Cow<'static, [u8]>>)>;
 
+/// Handler that may replace a resource load (Tauri's `on_web_resource_request`): it receives the
+/// request and a default 200/empty response; changing the status or body replaces the load.
+pub(crate) type ResourceRequestHandler = std::sync::Arc<
+  dyn Fn(Request<Vec<u8>>, &mut http::Response<std::borrow::Cow<'static, [u8]>>) + Send + Sync,
+>;
+
 /// Boxed handler for a custom protocol request.
 type CustomProtocolHandler =
   Box<dyn Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + Send + Sync>;
@@ -230,6 +236,7 @@ struct WebViewAttributes<'a> {
   pub navigation_handler: Option<Box<dyn Fn(String) -> bool>>,
   pub document_title_changed_handler: Option<Box<dyn Fn(String)>>,
   pub on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
+  pub web_resource_request_handler: Option<ResourceRequestHandler>,
   pub download_started_handler: Option<DownloadStartedHandler>,
   pub download_completed_handler: Option<DownloadCompletedHandler>,
   pub javascript_disabled: bool,
@@ -254,6 +261,7 @@ impl Default for WebViewAttributes<'_> {
       navigation_handler: None,
       document_title_changed_handler: None,
       on_page_load_handler: None,
+      web_resource_request_handler: None,
       download_started_handler: None,
       download_completed_handler: None,
       javascript_disabled: false,
@@ -391,6 +399,12 @@ impl<'a> WebViewBuilder<'a> {
     F: Fn(String) + 'static,
   {
     self.attrs.document_title_changed_handler = Some(Box::new(callback));
+    self
+  }
+
+  /// Set the handler that may replace resource loads (tracker/ad blocking).
+  pub fn with_web_resource_request_handler(mut self, handler: ResourceRequestHandler) -> Self {
+    self.attrs.web_resource_request_handler = Some(handler);
     self
   }
 
@@ -4865,6 +4879,10 @@ fn create_webview<T: UserEvent>(
 
   if let Some(color) = webview_attributes.background_color {
     webview_builder = webview_builder.with_background_color(color.into());
+  }
+
+  if let Some(handler) = pending.web_resource_request_handler {
+    webview_builder = webview_builder.with_web_resource_request_handler(std::sync::Arc::from(handler));
   }
 
   if let Some(navigation_handler) = pending.navigation_handler {

@@ -24,7 +24,8 @@ use servo::{
   },
   DevicePoint, EventLoopWaker, ImeEvent, InputEvent, KeyboardEvent, LoadStatus, MouseButtonAction,
   MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest,
-  OffscreenRenderingContext, Preferences, RenderingContext, Servo, ServoBuilder,
+  OffscreenRenderingContext, Preferences, RenderingContext, Servo, ServoBuilder, WebResourceLoad,
+  WebResourceResponse,
   Theme as ServoTheme, TouchEvent, TouchEventType, TouchId, TouchPointerType, UrlRequest,
   UserContentManager, UserScript, WebView as ServoWebView, WebViewBuilder as ServoWebViewBuilder,
   WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
@@ -63,18 +64,39 @@ fn ipc_message_body(message: &str) -> Option<&str> {
   message.strip_prefix(IPC_MESSAGE_PREFIX)
 }
 
-struct CustomProtocol {
-  webview_id: String,
-  handler: CustomProtocolHandler,
+/// (runtime webview id, handler) for one custom-protocol scheme of one webview.
+type ProtocolRoute = (String, std::sync::Arc<CustomProtocolHandler>);
+
+/// Custom-protocol handlers per webview. The Servo engine is shared, so every scheme is registered
+/// with it once as a `RoutedProtocol`, and each request is routed to the handler of the webview
+/// that issued it (`ServoRequest::target_webview_id`).
+static ROUTES: std::sync::LazyLock<
+  std::sync::Mutex<super::protocol_routes::ProtocolRoutes<servo::WebViewId, ProtocolRoute>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(super::protocol_routes::ProtocolRoutes::new()));
+
+struct RoutedProtocol {
+  scheme: String,
 }
 
-impl ProtocolHandler for CustomProtocol {
+impl ProtocolHandler for RoutedProtocol {
   fn load<'a>(
     &'a self,
     request: &'a mut ServoRequest,
     _done_chan: &mut DoneChannel,
     _context: &FetchContext,
   ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ServoResponse> + Send + 'a>> {
+    let route = ROUTES
+      .lock()
+      .ok()
+      .and_then(|routes| routes.resolve(request.target_webview_id.as_ref(), &self.scheme));
+    let Some((webview_id, handler)) = route else {
+      return Box::pin(std::future::ready(ServoResponse::network_error(
+        NetworkError::ResourceLoadError(format!(
+          "no webview registered for custom protocol {}",
+          self.scheme
+        )),
+      )));
+    };
     let url = request.current_url();
     let timing_type = request.timing_type();
     let method = request.method.clone();
@@ -92,8 +114,8 @@ impl ProtocolHandler for CustomProtocol {
     *request.headers_mut() = headers;
 
     let (sender, receiver) = futures_channel::oneshot::channel();
-    (self.handler)(
-      &self.webview_id,
+    (*handler)(
+      &webview_id,
       request,
       RequestAsyncResponder {
         responder: Box::new(move |response| {
@@ -161,6 +183,8 @@ struct Delegate {
   /// A navigation requested while the initial (about:blank) load is still in flight can be lost,
   /// so it is deferred until that load completes (or a timeout passes).
   nav_gate: RefCell<NavGate>,
+  /// Tauri's `on_web_resource_request` (tracker/ad blocking), if the app set one.
+  web_resource_request_handler: Option<crate::ResourceRequestHandler>,
   frame_ready: Cell<bool>,
   closed: Cell<bool>,
   ipc_handler: Option<Box<dyn Fn(http::Request<String>)>>,
@@ -214,6 +238,37 @@ impl WebViewDelegate for Delegate {
       request.deny();
     } else {
       request.allow();
+    }
+  }
+
+  /// Lets Tauri's `on_web_resource_request` handler replace a load (tracker/ad blocking). Not
+  /// intercepting drops `load`, which tells Servo to proceed with the real request.
+  fn load_web_resource(&self, _webview: ServoWebView, load: WebResourceLoad) {
+    let Some(handler) = &self.web_resource_request_handler else {
+      return;
+    };
+    let request = load.request();
+    let Ok(mut http_request) = http::Request::builder()
+      .method(request.method.clone())
+      .uri(request.url.as_str())
+      .body(Vec::new())
+    else {
+      return;
+    };
+    *http_request.headers_mut() = request.headers.clone();
+    let url = request.url.clone();
+    let mut response = http::Response::new(std::borrow::Cow::Borrowed(&[][..]));
+    handler(http_request, &mut response);
+    if let Some(intercept) = super::resource_filter::decide(&response) {
+      let mut intercepted = load.intercept(
+        WebResourceResponse::new(url)
+          .headers(intercept.headers)
+          .status_code(intercept.status),
+      );
+      if !intercept.body.is_empty() {
+        intercepted.send_body_data(intercept.body);
+      }
+      intercepted.finish();
     }
   }
 
@@ -680,6 +735,9 @@ pub struct Embedder {
 
 impl Drop for Embedder {
   fn drop(&mut self) {
+    if let Ok(mut table) = ROUTES.lock() {
+      table.unregister(&self.webview.id());
+    }
     if let RenderingTarget::Child {
       window_id,
       child_id,
@@ -711,6 +769,7 @@ impl Embedder {
     navigation_handler: Option<Box<dyn Fn(String) -> bool>>,
     document_title_changed_handler: Option<Box<dyn Fn(String)>>,
     on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
+    web_resource_request_handler: Option<crate::ResourceRequestHandler>,
   ) -> Result<Self> {
     let window = Rc::new(window);
     let context = Rc::new(
@@ -741,6 +800,7 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: Some(window.clone()),
       waker: waker.clone(),
+      web_resource_request_handler,
       nav_gate: RefCell::new(NavGate::new(
         std::time::Instant::now(),
         std::time::Duration::from_secs(2),
@@ -781,6 +841,7 @@ impl Embedder {
     navigation_handler: Option<Box<dyn Fn(String) -> bool>>,
     document_title_changed_handler: Option<Box<dyn Fn(String)>>,
     on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
+    web_resource_request_handler: Option<crate::ResourceRequestHandler>,
   ) -> Result<Self> {
     let window_id = parent.id();
     // All children of one native window share a single window rendering context.
@@ -826,6 +887,7 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: None,
       waker: waker.clone(),
+      web_resource_request_handler,
       nav_gate: RefCell::new(NavGate::new(
         std::time::Instant::now(),
         std::time::Duration::from_secs(2),
@@ -918,14 +980,16 @@ impl Embedder {
     // Thin master's spacing.
     preferences.layout_variable_fonts_enabled = true;
 
+    // Schemes are registered with the (shared) engine once, by the first webview; every webview's
+    // handlers go into the route table (provisionally until its Servo id exists, see below).
     let mut protocol_registry = ProtocolRegistry::default();
+    let mut routes: HashMap<String, ProtocolRoute> = HashMap::new();
     for (scheme, handler) in custom_protocols {
       protocol_registry
         .register(
           &scheme,
-          CustomProtocol {
-            webview_id: webview_id.clone(),
-            handler,
+          RoutedProtocol {
+            scheme: scheme.clone(),
           },
         )
         .map_err(|error| {
@@ -933,6 +997,10 @@ impl Embedder {
             "failed to register custom protocol {scheme}: {error:?}"
           ))
         })?;
+      routes.insert(scheme, (webview_id.clone(), std::sync::Arc::new(handler)));
+    }
+    if let Ok(mut table) = ROUTES.lock() {
+      table.set_provisional(routes);
     }
 
     // The engine is created by the first webview, so preferences, waker and protocol registry
@@ -977,6 +1045,10 @@ impl Embedder {
       }
       None => webview_builder.url(initial_url).build(),
     };
+    // The webview now has its Servo id: its provisional routes become its own.
+    if let Ok(mut table) = ROUTES.lock() {
+      table.promote(webview.id());
+    }
 
     servo.spin_event_loop();
 
@@ -1460,6 +1532,7 @@ mod tests {
       waker: EmbedderWaker::new(move || {
         wake_count_.fetch_add(1, Ordering::Relaxed);
       }),
+      web_resource_request_handler: None,
       nav_gate: RefCell::new(NavGate::new(
         std::time::Instant::now(),
         std::time::Duration::from_secs(2),
