@@ -538,9 +538,15 @@ fn non_zero_size(mut size: PhysicalSize<u32>) -> PhysicalSize<u32> {
   size
 }
 
-/// Owns the current Servo instance, rendering context, and top-level webview.
+thread_local! {
+  /// One `Servo` engine per process: libservo's global options can only be initialized once, so
+  /// every webview (toolbar and page children) shares this engine.
+  static SHARED_SERVO: RefCell<Option<Rc<Servo>>> = const { RefCell::new(None) };
+}
+
+/// Owns a handle to the shared Servo engine, a rendering context, and one webview.
 pub struct Embedder {
-  servo: Servo,
+  servo: Rc<Servo>,
   webview: ServoWebView,
   target: RenderingTarget,
   delegate: Rc<Delegate>,
@@ -746,12 +752,28 @@ impl Embedder {
         })?;
     }
 
-    let servo = ServoBuilder::default()
-      .preferences(preferences)
-      .event_loop_waker(Box::new(waker))
-      .protocol_registry(protocol_registry)
-      .build();
-    servo.setup_logging();
+    // The engine is created by the first webview, so preferences, waker and protocol registry
+    // come from it. `hard_fail` is off: a panic in one page's thread must show about:failure for
+    // that tab instead of exiting the whole process (Servo's default).
+    let servo = SHARED_SERVO.with(|cell| {
+      let mut slot = cell.borrow_mut();
+      if let Some(existing) = slot.as_ref() {
+        return existing.clone();
+      }
+      let mut opts = servo::Opts::default();
+      opts.hard_fail = super::options::engine_options().hard_fail;
+      let servo = Rc::new(
+        ServoBuilder::default()
+          .opts(opts)
+          .preferences(preferences)
+          .event_loop_waker(Box::new(waker))
+          .protocol_registry(protocol_registry)
+          .build(),
+      );
+      servo.setup_logging();
+      *slot = Some(servo.clone());
+      servo
+    });
 
     let user_content_manager = Rc::new(UserContentManager::new(&servo));
     if delegate.ipc_handler.is_some() {

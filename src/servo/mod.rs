@@ -23,7 +23,6 @@ fn parse_url(url: &str, description: &str) -> Result<Url> {
 }
 
 /// The URL a new webview starts on: its explicit URL, else its HTML, else `about:blank`.
-#[allow(dead_code)]
 pub(crate) fn initial_url(url: Option<&str>, html: Option<&str>) -> Result<Url> {
   match (url, html) {
     (Some(url), _) => parse_url(url, "initial URL"),
@@ -85,23 +84,14 @@ impl InnerWebView {
   ) -> Result<Self> {
     crate::install_rustls_crypto_provider();
     let id = attributes.id.unwrap_or("servo").to_owned();
-    let (initial_url, initial_headers) = match attributes.url {
-      Some(url) => (parse_url(&url, "initial URL")?, attributes.headers),
-      None => (
-        if let Some(html) = attributes.html {
-          html_url(&html)?
-        } else {
-          let demo_path = std::env::current_dir()?.join("examples/demo.html");
-          Url::from_file_path(&demo_path).map_err(|()| {
-            Error::Servo(format!(
-              "failed to convert demo path to URL: {}",
-              demo_path.display()
-            ))
-          })?
-        },
-        None,
-      ),
+    // Webviews created without a URL or HTML start on about:blank (Tauri passes `about:blank` as
+    // "no URL"); the old fallback tried to open a non-existent `examples/demo.html`.
+    let initial_headers = if attributes.url.is_some() {
+      attributes.headers
+    } else {
+      None
     };
+    let initial_url = initial_url(attributes.url.as_deref(), attributes.html.as_deref())?;
 
     let background_color = if attributes.transparent {
       Some([0.0; 4])
@@ -140,23 +130,14 @@ impl InnerWebView {
   ) -> Result<Self> {
     crate::install_rustls_crypto_provider();
     let id = attributes.id.unwrap_or("servo").to_owned();
-    let (initial_url, initial_headers) = match attributes.url {
-      Some(url) => (parse_url(&url, "initial URL")?, attributes.headers),
-      None => (
-        if let Some(html) = attributes.html {
-          html_url(&html)?
-        } else {
-          let demo_path = std::env::current_dir()?.join("examples/demo.html");
-          Url::from_file_path(&demo_path).map_err(|()| {
-            Error::Servo(format!(
-              "failed to convert demo path to URL: {}",
-              demo_path.display()
-            ))
-          })?
-        },
-        None,
-      ),
+    // Webviews created without a URL or HTML start on about:blank (Tauri passes `about:blank` as
+    // "no URL"); the old fallback tried to open a non-existent `examples/demo.html`.
+    let initial_headers = if attributes.url.is_some() {
+      attributes.headers
+    } else {
+      None
     };
+    let initial_url = initial_url(attributes.url.as_deref(), attributes.html.as_deref())?;
     let background_color = if attributes.transparent {
       Some([0.0; 4])
     } else {
