@@ -16,6 +16,8 @@ use self::embedder::Embedder;
 pub(crate) mod compositor;
 pub(crate) mod nav_gate;
 pub(crate) mod options;
+pub(crate) mod protocol_routes;
+pub(crate) mod resource_filter;
 pub mod embedder;
 
 fn parse_url(url: &str, description: &str) -> Result<Url> {
