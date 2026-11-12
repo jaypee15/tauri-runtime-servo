@@ -64,6 +64,23 @@ const IPC_BRIDGE_SCRIPT: &str = r#"
   });
 "#;
 
+/// The URI an IPC message is attributed to: the page's URL when it is a valid absolute URI that
+/// Tauri can parse as a URL. Anything else (`data:`, `blob:`, `about:blank`, no URL) is attributed
+/// to a fixed remote origin, so the message is evaluated as a remote page's and denied. A relative
+/// fallback such as `/` makes Tauri's `Url::parse(..).expect(..)` panic on the main thread.
+/// The URI an IPC message is attributed to: the page's URL when it is a valid absolute URI that
+/// Tauri can parse as a URL. Anything else (`data:`, `blob:`, `about:blank`, no URL) is attributed
+/// to a fixed remote origin, so the message is evaluated as a remote page's and denied. A relative
+/// fallback such as `/` makes Tauri's `Url::parse(..).expect(..)` panic on the main thread.
+fn ipc_request_uri(page_url: Option<&str>) -> http::Uri {
+  const FALLBACK: &str = "http://invalid.invalid/";
+  page_url
+    .filter(|url| url::Url::parse(url).is_ok())
+    .and_then(|url| url.parse::<http::Uri>().ok())
+    .filter(|uri| uri.scheme().is_some() && uri.authority().is_some())
+    .unwrap_or_else(|| FALLBACK.parse().expect("fallback URI is valid"))
+}
+
 fn ipc_message_body(message: &str) -> Option<&str> {
   message.strip_prefix(IPC_MESSAGE_PREFIX)
 }
@@ -287,13 +304,7 @@ impl WebViewDelegate for Delegate {
     else {
       return;
     };
-    let uri = webview
-      .url()
-      .map(|url| url.to_string())
-      .unwrap_or_else(|| "about:blank".into());
-    let uri = uri
-      .parse::<http::Uri>()
-      .unwrap_or_else(|_| http::Uri::from_static("/"));
+    let uri = ipc_request_uri(webview.url().map(|url| url.to_string()).as_deref());
     let request = http::Request::builder()
       .uri(uri)
       .body(body.to_owned())
@@ -1416,6 +1427,7 @@ impl Embedder {
 
 #[cfg(test)]
 mod tests {
+  use super::ipc_request_uri;
   use std::cell::RefCell;
   use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -1613,5 +1625,20 @@ mod tests {
       inserted_key_text(&TaoKey::Dead(Some('´')), Some("é"), Modifiers::empty()),
       Some("é".into())
     );
+  }
+
+  #[test]
+  fn ipc_uri_is_the_page_url_when_valid() {
+    assert_eq!(ipc_request_uri(Some("https://example.com/a?b=1")).to_string(), "https://example.com/a?b=1");
+    assert_eq!(ipc_request_uri(Some("tauri://localhost/")).to_string(), "tauri://localhost/");
+  }
+
+  #[test]
+  fn ipc_uri_for_non_hierarchical_or_missing_urls_is_a_parseable_remote_origin() {
+    for url in [Some("data:text/html,hi"), Some("blob:https://a.com/uuid"), Some("about:blank"), Some(""), None] {
+      let uri = ipc_request_uri(url).to_string();
+      assert!(url::Url::parse(&uri).is_ok(), "{url:?} -> {uri} must parse as an absolute URL");
+      assert!(uri.starts_with("http://"), "{url:?} -> {uri} must be attributed to a remote origin");
+    }
   }
 }
