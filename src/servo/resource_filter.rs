@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use http::{HeaderMap, Method, StatusCode};
+use http::Method;
 use url::Url;
 
 /// What to do with one resource load.
@@ -15,26 +15,22 @@ use url::Url;
 pub enum ResourceAction {
   /// Let the load proceed.
   Allow,
-  /// Replace the load with an empty `204 No Content`.
+  /// Fail the load with a network error (what content blockers do). Not an empty 204: a script
+  /// with an `integrity=` attribute makes libservo's SRI check panic on a body-less response.
   Block,
 }
 
-/// A replacement response for a load.
+/// How an intercepted load is answered.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Intercept {
-  pub status: StatusCode,
-  pub headers: HeaderMap,
-  pub body: Vec<u8>,
+pub enum Interception {
+  /// Fail the load with a network error.
+  Cancel,
 }
 
-pub fn intercept_for(action: ResourceAction) -> Option<Intercept> {
+pub fn intercept_for(action: ResourceAction) -> Option<Interception> {
   match action {
     ResourceAction::Allow => None,
-    ResourceAction::Block => Some(Intercept {
-      status: StatusCode::NO_CONTENT,
-      headers: HeaderMap::new(),
-      body: Vec::new(),
-    }),
+    ResourceAction::Block => Some(Interception::Cancel),
   }
 }
 
@@ -107,10 +103,8 @@ mod tests {
   }
 
   #[test]
-  fn intercept_for_block_is_204_with_empty_body() {
-    let i = intercept_for(ResourceAction::Block).expect("intercept");
-    assert_eq!(i.status, StatusCode::NO_CONTENT);
-    assert!(i.body.is_empty());
+  fn intercept_for_block_cancels_the_load() {
+    assert_eq!(intercept_for(ResourceAction::Block), Some(Interception::Cancel));
   }
 
   #[test]

@@ -248,7 +248,7 @@ impl WebViewDelegate for Delegate {
   /// Asks the app's resource filter about every load (tracker/ad blocking). Not intercepting drops
   /// `load`, which tells Servo to proceed with the real request.
   fn load_web_resource(&self, _webview: ServoWebView, load: WebResourceLoad) {
-    use super::resource_filter::{filter_action, intercept_for, ResourceRequestInfo};
+    use super::resource_filter::{filter_action, intercept_for, Interception, ResourceRequestInfo};
     let request = load.request();
     let action = filter_action(&ResourceRequestInfo {
       webview_label: &self.label,
@@ -256,17 +256,15 @@ impl WebViewDelegate for Delegate {
       method: &request.method,
       is_main_frame: request.is_for_main_frame,
     });
-    if let Some(intercept) = intercept_for(action) {
-      let url = request.url.clone();
-      let mut intercepted = load.intercept(
-        WebResourceResponse::new(url)
-          .headers(intercept.headers)
-          .status_code(intercept.status),
-      );
-      if !intercept.body.is_empty() {
-        intercepted.send_body_data(intercept.body);
+    if let Some(interception) = intercept_for(action) {
+      match interception {
+        Interception::Cancel => {
+          // A network error, as content blockers produce. `load.intercept(..).finish()` with an
+          // empty body panics libservo's subresource-integrity check on `integrity=` scripts.
+          let url = load.request().url.clone();
+          load.intercept(WebResourceResponse::new(url)).cancel();
+        }
       }
-      intercepted.finish();
     }
   }
 
