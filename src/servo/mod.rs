@@ -18,6 +18,7 @@ pub(crate) mod nav_gate;
 pub(crate) mod options;
 pub(crate) mod protocol_routes;
 pub(crate) mod resource_filter;
+pub use resource_filter::{set_resource_filter, ResourceAction, ResourceFilter, ResourceRequestInfo};
 pub mod embedder;
 
 fn parse_url(url: &str, description: &str) -> Result<Url> {
@@ -106,7 +107,6 @@ impl InnerWebView {
     let navigation_handler = attributes.navigation_handler;
     let document_title_changed_handler = attributes.document_title_changed_handler;
     let on_page_load_handler = attributes.on_page_load_handler;
-    let web_resource_request_handler = attributes.web_resource_request_handler;
     window.set_visible(attributes.visible);
 
     let embedder = Embedder::new(
@@ -122,7 +122,6 @@ impl InnerWebView {
       navigation_handler,
       document_title_changed_handler,
       on_page_load_handler,
-      web_resource_request_handler,
     )?;
     Ok(Self { id, embedder })
   }
@@ -155,7 +154,6 @@ impl InnerWebView {
     let navigation_handler = attributes.navigation_handler;
     let document_title_changed_handler = attributes.document_title_changed_handler;
     let on_page_load_handler = attributes.on_page_load_handler;
-    let web_resource_request_handler = attributes.web_resource_request_handler;
     let embedder = Embedder::new_child(
       parent,
       wake,
@@ -170,7 +168,6 @@ impl InnerWebView {
       navigation_handler,
       document_title_changed_handler,
       on_page_load_handler,
-      web_resource_request_handler,
     )?;
     if !visible {
       embedder.set_visible(false);

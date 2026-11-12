@@ -183,8 +183,8 @@ struct Delegate {
   /// A navigation requested while the initial (about:blank) load is still in flight can be lost,
   /// so it is deferred until that load completes (or a timeout passes).
   nav_gate: RefCell<NavGate>,
-  /// Tauri's `on_web_resource_request` (tracker/ad blocking), if the app set one.
-  web_resource_request_handler: Option<crate::ResourceRequestHandler>,
+  /// This webview's Tauri label, reported to the app's resource filter.
+  label: String,
   frame_ready: Cell<bool>,
   closed: Cell<bool>,
   ipc_handler: Option<Box<dyn Fn(http::Request<String>)>>,
@@ -241,25 +241,19 @@ impl WebViewDelegate for Delegate {
     }
   }
 
-  /// Lets Tauri's `on_web_resource_request` handler replace a load (tracker/ad blocking). Not
-  /// intercepting drops `load`, which tells Servo to proceed with the real request.
+  /// Asks the app's resource filter about every load (tracker/ad blocking). Not intercepting drops
+  /// `load`, which tells Servo to proceed with the real request.
   fn load_web_resource(&self, _webview: ServoWebView, load: WebResourceLoad) {
-    let Some(handler) = &self.web_resource_request_handler else {
-      return;
-    };
+    use super::resource_filter::{filter_action, intercept_for, ResourceRequestInfo};
     let request = load.request();
-    let Ok(mut http_request) = http::Request::builder()
-      .method(request.method.clone())
-      .uri(request.url.as_str())
-      .body(Vec::new())
-    else {
-      return;
-    };
-    *http_request.headers_mut() = request.headers.clone();
-    let url = request.url.clone();
-    let mut response = http::Response::new(std::borrow::Cow::Borrowed(&[][..]));
-    handler(http_request, &mut response);
-    if let Some(intercept) = super::resource_filter::decide(&response) {
+    let action = filter_action(&ResourceRequestInfo {
+      webview_label: &self.label,
+      url: &request.url,
+      method: &request.method,
+      is_main_frame: request.is_for_main_frame,
+    });
+    if let Some(intercept) = intercept_for(action) {
+      let url = request.url.clone();
       let mut intercepted = load.intercept(
         WebResourceResponse::new(url)
           .headers(intercept.headers)
@@ -769,7 +763,6 @@ impl Embedder {
     navigation_handler: Option<Box<dyn Fn(String) -> bool>>,
     document_title_changed_handler: Option<Box<dyn Fn(String)>>,
     on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
-    web_resource_request_handler: Option<crate::ResourceRequestHandler>,
   ) -> Result<Self> {
     let window = Rc::new(window);
     let context = Rc::new(
@@ -800,7 +793,7 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: Some(window.clone()),
       waker: waker.clone(),
-      web_resource_request_handler,
+      label: webview_id.clone(),
       nav_gate: RefCell::new(NavGate::new(
         std::time::Instant::now(),
         std::time::Duration::from_secs(2),
@@ -841,7 +834,6 @@ impl Embedder {
     navigation_handler: Option<Box<dyn Fn(String) -> bool>>,
     document_title_changed_handler: Option<Box<dyn Fn(String)>>,
     on_page_load_handler: Option<Box<dyn Fn(PageLoadEvent, String)>>,
-    web_resource_request_handler: Option<crate::ResourceRequestHandler>,
   ) -> Result<Self> {
     let window_id = parent.id();
     // All children of one native window share a single window rendering context.
@@ -887,7 +879,7 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: None,
       waker: waker.clone(),
-      web_resource_request_handler,
+      label: webview_id.clone(),
       nav_gate: RefCell::new(NavGate::new(
         std::time::Instant::now(),
         std::time::Duration::from_secs(2),
@@ -1532,7 +1524,7 @@ mod tests {
       waker: EmbedderWaker::new(move || {
         wake_count_.fetch_add(1, Ordering::Relaxed);
       }),
-      web_resource_request_handler: None,
+      label: String::new(),
       nav_gate: RefCell::new(NavGate::new(
         std::time::Instant::now(),
         std::time::Duration::from_secs(2),

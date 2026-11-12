@@ -1,11 +1,25 @@
-//! Decides whether a Tauri `on_web_resource_request` handler asked to replace a resource load.
+//! App-level filter for resource loads (tracker/ad blocking).
+//!
+//! Tauri's `on_web_resource_request` is consumed by Tauri itself and only sees `tauri://` asset
+//! requests, so it can never block network loads. The host registers a filter here instead; the
+//! webview delegate asks it about every load (libservo's `WebViewDelegate::load_web_resource`).
 #![allow(dead_code)]
 
-use std::borrow::Cow;
+use std::sync::{Arc, RwLock};
 
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, Method, StatusCode};
+use url::Url;
 
-/// The replacement response the handler asked for.
+/// What to do with one resource load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceAction {
+  /// Let the load proceed.
+  Allow,
+  /// Replace the load with an empty `204 No Content`.
+  Block,
+}
+
+/// A replacement response for a load.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Intercept {
   pub status: StatusCode,
@@ -13,55 +27,133 @@ pub struct Intercept {
   pub body: Vec<u8>,
 }
 
-/// The handler receives a default response (200, empty). If it left that untouched the load
-/// proceeds; if it changed the status or filled the body, that response replaces the load.
-pub fn decide(response: &http::Response<Cow<'static, [u8]>>) -> Option<Intercept> {
-  if response.status() == StatusCode::OK && response.body().is_empty() {
-    return None;
+pub fn intercept_for(action: ResourceAction) -> Option<Intercept> {
+  match action {
+    ResourceAction::Allow => None,
+    ResourceAction::Block => Some(Intercept {
+      status: StatusCode::NO_CONTENT,
+      headers: HeaderMap::new(),
+      body: Vec::new(),
+    }),
   }
-  Some(Intercept {
-    status: response.status(),
-    headers: response.headers().clone(),
-    body: response.body().to_vec(),
-  })
+}
+
+/// What the filter is told about a load.
+pub struct ResourceRequestInfo<'a> {
+  /// The Tauri label of the webview that issued the load.
+  pub webview_label: &'a str,
+  pub url: &'a Url,
+  pub method: &'a Method,
+  pub is_main_frame: bool,
+}
+
+pub type ResourceFilter = Arc<dyn Fn(&ResourceRequestInfo<'_>) -> ResourceAction + Send + Sync>;
+
+/// Holder for the filter (testable without the process-wide global).
+pub struct FilterSlot {
+  filter: RwLock<Option<ResourceFilter>>,
+}
+
+impl FilterSlot {
+  pub const fn new() -> Self {
+    FilterSlot {
+      filter: RwLock::new(None),
+    }
+  }
+  pub fn set(&self, filter: ResourceFilter) {
+    if let Ok(mut slot) = self.filter.write() {
+      *slot = Some(filter);
+    }
+  }
+
+  /// `Allow` when no filter is set.
+  pub fn decide(&self, info: &ResourceRequestInfo<'_>) -> ResourceAction {
+    // Clone the Arc so the filter runs without holding the lock.
+    let filter = self.filter.read().ok().and_then(|slot| slot.clone());
+    match filter {
+      Some(filter) => filter(info),
+      None => ResourceAction::Allow,
+    }
+  }
+}
+
+static FILTER: FilterSlot = FilterSlot::new();
+
+/// Registers (or replaces) the app's resource filter. Call before pages load.
+pub fn set_resource_filter(filter: ResourceFilter) {
+  FILTER.set(filter);
+}
+
+pub(crate) fn filter_action(info: &ResourceRequestInfo<'_>) -> ResourceAction {
+  FILTER.decide(info)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
 
-  fn default_response() -> http::Response<Cow<'static, [u8]>> {
-    http::Response::new(Cow::Borrowed(&[][..]))
+  fn info<'a>(label: &'a str, url: &'a Url, method: &'a Method) -> ResourceRequestInfo<'a> {
+    ResourceRequestInfo {
+      webview_label: label,
+      url,
+      method,
+      is_main_frame: false,
+    }
   }
 
   #[test]
-  fn untouched_default_response_lets_the_load_proceed() {
-    assert_eq!(decide(&default_response()), None);
+  fn intercept_for_allow_is_none() {
+    assert_eq!(intercept_for(ResourceAction::Allow), None);
   }
 
   #[test]
-  fn changed_status_intercepts_with_that_status() {
-    let mut r = default_response();
-    *r.status_mut() = StatusCode::NO_CONTENT;
-    let i = decide(&r).expect("intercept");
+  fn intercept_for_block_is_204_with_empty_body() {
+    let i = intercept_for(ResourceAction::Block).expect("intercept");
     assert_eq!(i.status, StatusCode::NO_CONTENT);
     assert!(i.body.is_empty());
   }
 
   #[test]
-  fn filled_body_intercepts_even_with_ok_status() {
-    let mut r = default_response();
-    *r.body_mut() = Cow::Owned(b"blocked".to_vec());
-    let i = decide(&r).expect("intercept");
-    assert_eq!(i.status, StatusCode::OK);
-    assert_eq!(i.body, b"blocked".to_vec());
+  fn slot_without_filter_allows() {
+    let url = Url::parse("https://tracker.example/t.js").unwrap();
+    let slot = FilterSlot::new();
+    assert_eq!(
+      slot.decide(&info("content-1", &url, &Method::GET)),
+      ResourceAction::Allow
+    );
   }
 
   #[test]
-  fn headers_only_change_does_not_intercept() {
-    let mut r = default_response();
-    r.headers_mut()
-      .insert("x-seen", http::HeaderValue::from_static("1"));
-    assert_eq!(decide(&r), None);
+  fn slot_applies_the_filter_and_a_replacement() {
+    let url = Url::parse("https://tracker.example/t.js").unwrap();
+    let slot = FilterSlot::new();
+    slot.set(Arc::new(|i| {
+      if i.url.host_str() == Some("tracker.example") {
+        ResourceAction::Block
+      } else {
+        ResourceAction::Allow
+      }
+    }));
+    assert_eq!(
+      slot.decide(&info("content-1", &url, &Method::GET)),
+      ResourceAction::Block
+    );
+    slot.set(Arc::new(|_| ResourceAction::Allow));
+    assert_eq!(
+      slot.decide(&info("content-1", &url, &Method::GET)),
+      ResourceAction::Allow
+    );
+  }
+
+  #[test]
+  fn filter_receives_the_webview_label_and_url() {
+    let url = Url::parse("https://example.com/a.js").unwrap();
+    let slot = FilterSlot::new();
+    slot.set(Arc::new(|i| {
+      assert_eq!(i.webview_label, "content-tab-7");
+      assert_eq!(i.url.path(), "/a.js");
+      ResourceAction::Allow
+    }));
+    slot.decide(&info("content-tab-7", &url, &Method::GET));
   }
 }
