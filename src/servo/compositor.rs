@@ -100,6 +100,11 @@ impl Compositor {
       .map(|slot| slot.id)
   }
 
+  /// The child's current bounds, if it exists.
+  pub fn bounds(&self, id: ChildId) -> Option<Bounds> {
+    self.slots.iter().find(|slot| slot.id == id).map(|slot| slot.bounds)
+  }
+
   pub fn len(&self) -> usize {
     self.slots.len()
   }
@@ -175,6 +180,19 @@ mod tests {
     assert_eq!(c.len(), 1);
     assert_eq!(c.draw_order(), vec![1]);
     assert_eq!(c.hit_test(10, 10), Some(1));
+  }
+
+  #[test]
+  fn bounds_roundtrip_and_updates() {
+    let mut c = Compositor::new();
+    assert_eq!(c.bounds(1), None);
+    c.add(1, b(0, 0, 100, 100));
+    assert_eq!(c.bounds(1), Some(b(0, 0, 100, 100)));
+    c.set_bounds(1, b(5, 6, 70, 80));
+    assert_eq!(c.bounds(1), Some(b(5, 6, 70, 80)));
+    // bounds keep applying to hit testing
+    assert_eq!(c.hit_test(6, 7), Some(1));
+    assert_eq!(c.hit_test(2, 2), None);
   }
 
   #[test]
