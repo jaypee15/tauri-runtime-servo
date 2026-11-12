@@ -343,16 +343,18 @@ impl RenderingTarget {
       Self::Window { .. } => webview.resize(non_zero_size(parent_size)),
       Self::Child {
         parent_context,
-        context,
         bounds,
         physical_bounds,
         scale_factor: current_scale_factor,
+        ..
       } => {
         current_scale_factor.set(scale_factor);
         parent_context.resize(non_zero_size(parent_size));
         let bounds = PhysicalBounds::from_rect(bounds.get(), scale_factor);
         physical_bounds.set(bounds);
-        context.resize(bounds.size);
+        // libservo's `resize_rendering_context` returns early when the context already has the
+        // new size, so the offscreen context must NOT be resized first: `webview.resize` resizes
+        // it and updates the viewport, display list and repaint.
         webview.resize(bounds.size);
       }
     }
@@ -378,7 +380,6 @@ impl RenderingTarget {
         webview.resize(non_zero_size(size));
       }
       Self::Child {
-        context,
         bounds: current_bounds,
         physical_bounds,
         scale_factor,
@@ -387,7 +388,9 @@ impl RenderingTarget {
         current_bounds.set(bounds);
         let bounds = PhysicalBounds::from_rect(bounds, scale_factor.get());
         physical_bounds.set(bounds);
-        context.resize(bounds.size);
+        // libservo's `resize_rendering_context` returns early when the context already has the
+        // new size, so the offscreen context must NOT be resized first: `webview.resize` resizes
+        // it and updates the viewport, display list and repaint.
         webview.resize(bounds.size);
       }
     }
