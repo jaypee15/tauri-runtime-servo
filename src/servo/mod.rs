@@ -14,6 +14,7 @@ use crate::{WebViewAttributes, WebViewBuilder};
 use self::embedder::Embedder;
 
 pub(crate) mod compositor;
+pub(crate) mod engine_registry;
 pub(crate) mod nav_gate;
 pub(crate) mod options;
 pub(crate) mod protocol_routes;

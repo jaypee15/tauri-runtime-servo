@@ -104,6 +104,7 @@ type IpcHandler = dyn Fn(Request<String>) + 'static;
 
 mod monitor;
 pub mod servo;
+pub use servo::embedder::{bring_to_front, compositor_child_count, live_webview_count};
 pub use servo::{set_resource_filter, ResourceAction, ResourceFilter, ResourceRequestInfo};
 #[cfg(windows)]
 mod undecorated_resizing;
@@ -4279,6 +4280,7 @@ fn handle_event_loop<T: UserEvent>(
 
     Event::LoopDestroyed => {
       callback(RunEvent::Exit);
+      servo::embedder::release_engine_if_idle();
     }
 
     Event::RedrawRequested(id) => {

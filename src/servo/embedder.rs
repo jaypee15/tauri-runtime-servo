@@ -31,6 +31,7 @@ use servo::{
   WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use super::compositor::{Bounds, ChildId, Compositor};
+use super::engine_registry::EngineRegistry;
 use super::nav_gate::{NavAction, NavGate};
 use tao::{
   dpi::{PhysicalPosition, PhysicalSize},
@@ -630,11 +631,55 @@ struct WindowComp {
   context: Rc<WindowRenderingContext>,
   compositor: Compositor,
   children: HashMap<ChildId, Rc<OffscreenRenderingContext>>,
+  /// Tauri webview label -> child id, so the app can reorder children by label.
+  labels: HashMap<String, ChildId>,
 }
 
 thread_local! {
   static WINDOWS: RefCell<HashMap<tao::window::WindowId, WindowComp>> = RefCell::new(HashMap::new());
   static NEXT_CHILD_ID: Cell<ChildId> = const { Cell::new(1) };
+  /// Live webviews using the shared engine (see `EngineRegistry`).
+  static LIVE: RefCell<EngineRegistry> = RefCell::new(EngineRegistry::new());
+}
+
+/// Number of webviews currently alive (toolbar and page children).
+pub fn live_webview_count() -> usize {
+  LIVE.with(|live| live.borrow().live())
+}
+
+/// Children registered with the per-window compositors, summed over all windows.
+pub fn compositor_child_count() -> usize {
+  WINDOWS.with(|windows| windows.borrow().values().map(|comp| comp.compositor.len()).sum())
+}
+
+/// Moves the child with this Tauri webview label to the front of its window's draw order (and of
+/// input hit-testing) and redraws. Must be called on the main thread (use
+/// `AppHandle::run_on_main_thread`). Returns whether a child with that label exists.
+pub fn bring_to_front(label: &str) -> bool {
+  let found = WINDOWS.with(|windows| {
+    let mut windows = windows.borrow_mut();
+    for (window_id, comp) in windows.iter_mut() {
+      if let Some(child_id) = comp.labels.get(label).copied() {
+        comp.compositor.bring_to_front(child_id);
+        return Some((*window_id, comp.context.clone()));
+      }
+    }
+    None
+  });
+  let Some((window_id, context)) = found else {
+    return false;
+  };
+  composite_children(window_id, &context);
+  context.present();
+  true
+}
+
+/// Releases the shared engine at event-loop exit, once no webview remains. libservo cannot be
+/// re-initialized in the same process, so the engine is never dropped earlier.
+pub(crate) fn release_engine_if_idle() {
+  if LIVE.with(|live| live.borrow().is_idle()) {
+    SHARED_SERVO.with(|cell| cell.borrow_mut().take());
+  }
 }
 
 fn next_child_id() -> ChildId {
@@ -729,6 +774,7 @@ pub struct Embedder {
 
 impl Drop for Embedder {
   fn drop(&mut self) {
+    let _ = LIVE.try_with(|live| live.borrow_mut().release());
     if let Ok(mut table) = ROUTES.lock() {
       table.unregister(&self.webview.id());
     }
@@ -742,6 +788,7 @@ impl Drop for Embedder {
         if let Some(comp) = windows.borrow_mut().get_mut(window_id) {
           comp.compositor.remove(*child_id);
           comp.children.remove(child_id);
+          comp.labels.remove(&self.delegate.label);
         }
       });
     }
@@ -781,6 +828,7 @@ impl Embedder {
           context: context.clone(),
           compositor: Compositor::new(),
           children: HashMap::new(),
+          labels: HashMap::new(),
         },
       );
     });
@@ -861,6 +909,7 @@ impl Embedder {
           context: context.clone(),
           compositor: Compositor::new(),
           children: HashMap::new(),
+          labels: HashMap::new(),
         },
       );
       Ok(context)
@@ -873,6 +922,7 @@ impl Embedder {
       if let Some(comp) = windows.borrow_mut().get_mut(&window_id) {
         comp.compositor.add(child_id, to_bounds(physical_bounds));
         comp.children.insert(child_id, context.clone());
+        comp.labels.insert(webview_id.clone(), child_id);
       }
     });
     let waker = EmbedderWaker::new(wake);
@@ -1044,6 +1094,7 @@ impl Embedder {
 
     servo.spin_event_loop();
 
+    LIVE.with(|live| live.borrow_mut().acquire());
     Ok(Self {
       servo,
       webview,
