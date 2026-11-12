@@ -14,10 +14,44 @@ use crate::{WebViewAttributes, WebViewBuilder};
 use self::embedder::Embedder;
 
 pub(crate) mod compositor;
+pub(crate) mod nav_gate;
+pub(crate) mod options;
 pub mod embedder;
 
 fn parse_url(url: &str, description: &str) -> Result<Url> {
   Url::parse(url).map_err(|error| Error::Servo(format!("invalid {description}: {error}")))
+}
+
+/// The URL a new webview starts on: its explicit URL, else its HTML, else `about:blank`.
+#[allow(dead_code)]
+pub(crate) fn initial_url(url: Option<&str>, html: Option<&str>) -> Result<Url> {
+  match (url, html) {
+    (Some(url), _) => parse_url(url, "initial URL"),
+    (None, Some(html)) => html_url(html),
+    (None, None) => parse_url("about:blank", "default URL"),
+  }
+}
+
+#[cfg(test)]
+mod initial_url_tests {
+  use super::*;
+
+  #[test]
+  fn initial_url_defaults_to_about_blank() {
+    assert_eq!(initial_url(None, None).unwrap().as_str(), "about:blank");
+  }
+
+  #[test]
+  fn initial_url_prefers_explicit_url() {
+    let u = initial_url(Some("https://example.com/"), Some("<p>x</p>")).unwrap();
+    assert_eq!(u.as_str(), "https://example.com/");
+  }
+
+  #[test]
+  fn initial_url_uses_html_when_no_url() {
+    let u = initial_url(None, Some("<p>x</p>")).unwrap();
+    assert!(u.as_str().starts_with("data:text/html"));
+  }
 }
 
 fn html_url(html: &str) -> Result<Url> {
