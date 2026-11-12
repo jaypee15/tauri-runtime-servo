@@ -30,6 +30,7 @@ use servo::{
   WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use super::compositor::{Bounds, ChildId, Compositor};
+use super::nav_gate::{NavAction, NavGate};
 use tao::{
   dpi::{PhysicalPosition, PhysicalSize},
   event::{ElementState, MouseButton as TaoMouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
@@ -157,6 +158,9 @@ impl EventLoopWaker for EmbedderWaker {
 struct Delegate {
   window: Option<Rc<Window>>,
   waker: EmbedderWaker,
+  /// A navigation requested while the initial (about:blank) load is still in flight can be lost,
+  /// so it is deferred until that load completes (or a timeout passes).
+  nav_gate: RefCell<NavGate>,
   frame_ready: Cell<bool>,
   closed: Cell<bool>,
   ipc_handler: Option<Box<dyn Fn(http::Request<String>)>>,
@@ -184,6 +188,11 @@ impl WebViewDelegate for Delegate {
   }
 
   fn notify_load_status_changed(&self, webview: ServoWebView, status: LoadStatus) {
+    if matches!(status, LoadStatus::Complete) {
+      if let Some(url) = self.nav_gate.borrow_mut().initial_load_complete() {
+        webview.load(url);
+      }
+    }
     let Some(handler) = &self.on_page_load_handler else {
       return;
     };
@@ -732,6 +741,10 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: Some(window.clone()),
       waker: waker.clone(),
+      nav_gate: RefCell::new(NavGate::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(2),
+      )),
       frame_ready: Cell::new(false),
       closed: Cell::new(false),
       ipc_handler,
@@ -813,6 +826,10 @@ impl Embedder {
     let delegate = Rc::new(Delegate {
       window: None,
       waker: waker.clone(),
+      nav_gate: RefCell::new(NavGate::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(2),
+      )),
       frame_ready: Cell::new(false),
       closed: Cell::new(false),
       ipc_handler,
@@ -977,7 +994,28 @@ impl Embedder {
     })
   }
 
+  /// Navigates, deferring while the initial load is in flight (see `NavGate`).
+  pub(crate) fn load(&self, url: Url) {
+    let action = self
+      .delegate
+      .nav_gate
+      .borrow_mut()
+      .request(url, std::time::Instant::now());
+    if let NavAction::LoadNow(url) = action {
+      self.webview.load(url);
+    }
+    self.servo.spin_event_loop();
+  }
+
   pub fn handle_user_event(&self) {
+    if let Some(url) = self
+      .delegate
+      .nav_gate
+      .borrow_mut()
+      .tick(std::time::Instant::now())
+    {
+      self.webview.load(url);
+    }
     if let Some(text) = self.pending_ime_text.borrow_mut().take() {
       self.commit_ime_text(text);
     }
@@ -1262,10 +1300,13 @@ impl Embedder {
 
 #[cfg(test)]
 mod tests {
+  use std::cell::RefCell;
   use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
   };
+
+  use crate::servo::nav_gate::NavGate;
 
   use dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
   use keyboard_types::{Code, Key, Modifiers, NamedKey};
@@ -1419,6 +1460,10 @@ mod tests {
       waker: EmbedderWaker::new(move || {
         wake_count_.fetch_add(1, Ordering::Relaxed);
       }),
+      nav_gate: RefCell::new(NavGate::new(
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(2),
+      )),
       frame_ready: Default::default(),
       closed: Default::default(),
       ipc_handler: None,

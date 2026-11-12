@@ -302,8 +302,7 @@ impl InnerWebView {
 
   pub fn load_url(&self, url: &str) -> Result<()> {
     let url = Url::parse(url).map_err(|error| Error::Servo(format!("invalid URL: {error}")))?;
-    self.embedder.webview().load(url);
-    self.embedder.servo().spin_event_loop();
+    self.embedder.load(url);
     Ok(())
   }
 
