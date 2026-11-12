@@ -13,6 +13,7 @@ use crate::{WebViewAttributes, WebViewBuilder};
 
 use self::embedder::Embedder;
 
+pub(crate) mod compositor;
 pub mod embedder;
 
 fn parse_url(url: &str, description: &str) -> Result<Url> {
