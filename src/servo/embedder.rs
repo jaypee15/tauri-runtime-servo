@@ -390,6 +390,19 @@ impl RenderingTarget {
     }
   }
 
+  fn set_child_visible(&self, visible: bool) {
+    if let Self::Child {
+      window_id,
+      child_id,
+      ..
+    } = self
+    {
+      with_compositor(*window_id, |compositor| {
+        compositor.set_visible(*child_id, visible)
+      });
+    }
+  }
+
   fn set_window_visible(&self, visible: bool) {
     if let Self::Window { window, .. } = self {
       window.set_visible(visible);
@@ -1203,12 +1216,16 @@ impl Embedder {
 
   pub(crate) fn set_visible(&self, visible: bool) {
     self.target.set_window_visible(visible);
+    // A hidden child leaves the draw order and stops receiving input; the repaint recomposes the
+    // window so its pixels disappear (or reappear) right away.
+    self.target.set_child_visible(visible);
     if visible {
       self.webview.show();
-      self.delegate.request_repaint();
     } else {
+      self.blur_webview();
       self.webview.hide();
     }
+    self.delegate.request_repaint();
     self.servo.spin_event_loop();
   }
 
