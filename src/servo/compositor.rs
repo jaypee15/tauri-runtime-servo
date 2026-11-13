@@ -32,10 +32,19 @@ struct Slot {
   visible: bool,
 }
 
+/// A rectangle of one child drawn on top of everything else (a dropdown that must show over the
+/// page although its own layer is behind it). Coordinates are window coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overlay {
+  pub id: ChildId,
+  pub bounds: Bounds,
+}
+
 /// Children ordered back to front.
 #[derive(Default)]
 pub struct Compositor {
   slots: Vec<Slot>,
+  overlay: Option<Overlay>,
 }
 
 impl Compositor {
@@ -90,8 +99,22 @@ impl Compositor {
       .collect()
   }
 
-  /// The topmost visible child containing the point.
+  /// Draws `bounds` of child `id` above every other child (and routes input there), or clears it.
+  pub fn set_overlay(&mut self, overlay: Option<Overlay>) {
+    self.overlay = overlay;
+  }
+
+  pub fn overlay(&self) -> Option<Overlay> {
+    self.overlay
+  }
+
+  /// The topmost visible child containing the point; the overlay region wins over every child.
   pub fn hit_test(&self, x: i32, y: i32) -> Option<ChildId> {
+    if let Some(overlay) = self.overlay {
+      if overlay.bounds.contains(x, y) && self.slots.iter().any(|slot| slot.id == overlay.id) {
+        return Some(overlay.id);
+      }
+    }
     self
       .slots
       .iter()
@@ -204,5 +227,37 @@ mod tests {
     assert_eq!(c.hit_test(110, 40), None);
     assert_eq!(c.hit_test(50, 70), None);
     assert_eq!(c.hit_test(9, 40), None);
+  }
+
+  #[test]
+  fn overlay_region_wins_hit_tests_over_a_child_in_front() {
+    let mut c = Compositor::new();
+    c.add(1, b(0, 0, 200, 200)); // toolbar, full window, behind
+    c.add(2, b(0, 100, 200, 100)); // page, in front
+    assert_eq!(c.hit_test(150, 150), Some(2));
+    c.set_overlay(Some(Overlay { id: 1, bounds: b(120, 100, 80, 90) }));
+    assert_eq!(c.hit_test(150, 150), Some(1), "inside the overlay: the toolbar");
+    assert_eq!(c.hit_test(50, 150), Some(2), "outside the overlay: the page");
+  }
+
+  #[test]
+  fn clearing_the_overlay_restores_normal_hit_testing() {
+    let mut c = Compositor::new();
+    c.add(1, b(0, 0, 200, 200));
+    c.add(2, b(0, 100, 200, 100));
+    c.set_overlay(Some(Overlay { id: 1, bounds: b(120, 100, 80, 90) }));
+    c.set_overlay(None);
+    assert_eq!(c.hit_test(150, 150), Some(2));
+    assert_eq!(c.overlay(), None);
+  }
+
+  #[test]
+  fn overlay_of_a_removed_child_is_ignored() {
+    let mut c = Compositor::new();
+    c.add(1, b(0, 0, 200, 200));
+    c.add(2, b(0, 100, 200, 100));
+    c.set_overlay(Some(Overlay { id: 1, bounds: b(120, 100, 80, 90) }));
+    c.remove(1);
+    assert_eq!(c.hit_test(150, 150), Some(2));
   }
 }

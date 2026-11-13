@@ -22,7 +22,7 @@ use servo::{
     DoneChannel, FetchContext, HttpStatus, NetworkError, ProtocolHandler, ProtocolRegistry,
     Request as ServoRequest, ResourceFetchTiming, Response as ServoResponse, ResponseBody,
   },
-  DevicePoint, EventLoopWaker, ImeEvent, InputEvent, KeyboardEvent, LoadStatus, MouseButtonAction,
+  DeviceIntRect, DevicePoint, EventLoopWaker, ImeEvent, InputEvent, KeyboardEvent, LoadStatus, MouseButtonAction,
   MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest,
   OffscreenRenderingContext, Preferences, RenderingContext, Servo, ServoBuilder, WebResourceLoad,
   WebResourceResponse,
@@ -30,7 +30,7 @@ use servo::{
   UserContentManager, UserScript, WebView as ServoWebView, WebViewBuilder as ServoWebViewBuilder,
   WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
-use super::compositor::{Bounds, ChildId, Compositor};
+use super::compositor::{Bounds, ChildId, Compositor, Overlay};
 use super::engine_registry::EngineRegistry;
 use super::nav_gate::{NavAction, NavGate};
 use tao::{
@@ -686,6 +686,32 @@ pub fn bring_to_front(label: &str) -> bool {
   true
 }
 
+/// Draws the rectangle `(x, y, width, height)` (window pixels) of the webview with this label above
+/// every other webview of its window, and sends pointer input there; `None` clears it. For a
+/// dropdown drawn by the toolbar webview that must overlay the page webview in front of it. Must be
+/// called on the main thread. Returns whether a webview with that label exists.
+pub fn set_overlay_region(label: &str, rect: Option<(i32, i32, u32, u32)>) -> bool {
+  let found = WINDOWS.with(|windows| {
+    let mut windows = windows.borrow_mut();
+    for (window_id, comp) in windows.iter_mut() {
+      if let Some(child_id) = comp.labels.get(label).copied() {
+        comp.compositor.set_overlay(rect.map(|(x, y, width, height)| Overlay {
+          id: child_id,
+          bounds: Bounds { x, y, width, height },
+        }));
+        return Some((*window_id, comp.context.clone()));
+      }
+    }
+    None
+  });
+  let Some((window_id, context)) = found else {
+    return false;
+  };
+  composite_children(window_id, &context);
+  context.present();
+  true
+}
+
 /// Releases the shared engine at event-loop exit, once no webview remains. libservo cannot be
 /// re-initialized in the same process, so the engine is never dropped earlier.
 pub(crate) fn release_engine_if_idle() {
@@ -767,7 +793,87 @@ fn composite_children(window_id: tao::window::WindowId, parent_context: &WindowR
         render_to_parent(parent_context.glow_gl_api().as_ref(), target);
       }
     }
+    if let Some(overlay) = comp.compositor.overlay() {
+      draw_overlay(parent_context, comp, overlay);
+    }
   });
+}
+
+/// Paints `overlay.bounds` of the overlay child's last frame on top of the window, over whatever the
+/// other children drew there. The layers cannot be alpha-blended (libservo copies them opaquely), so
+/// the region is read back from the child and copied across: used for a dropdown that belongs to the
+/// toolbar layer but must show above the page layer.
+fn draw_overlay(parent_context: &WindowRenderingContext, comp: &WindowComp, overlay: Overlay) {
+  use glow::HasContext as _;
+  let (Some(child), Some(child_bounds)) =
+    (comp.children.get(&overlay.id), comp.compositor.bounds(overlay.id))
+  else {
+    return;
+  };
+  // Overlay rectangle in the child's own pixels, clamped to its frame.
+  let x = (overlay.bounds.x - child_bounds.x).max(0);
+  let y = (overlay.bounds.y - child_bounds.y).max(0);
+  let w = (overlay.bounds.width as i32).min(child_bounds.width as i32 - x);
+  let h = (overlay.bounds.height as i32).min(child_bounds.height as i32 - y);
+  if w <= 0 || h <= 0 {
+    return;
+  }
+  // read_to_image takes GL coordinates (origin bottom-left) and returns the rows top-first.
+  let gl_y = child_bounds.height as i32 - y - h;
+  let Some(image) = child.read_to_image(DeviceIntRect::from_origin_and_size(
+    servo::DeviceIntPoint::new(x, gl_y),
+    servo::DeviceIntSize::new(w, h),
+  ))
+  else {
+    return;
+  };
+  let gl = parent_context.glow_gl_api();
+  parent_context.prepare_for_rendering();
+  let parent_height = parent_context.size().height as i32;
+  let dest_x = overlay.bounds.x.max(0);
+  let dest_top = parent_height - overlay.bounds.y.max(0);
+  unsafe {
+    let window_fbo = u32::try_from(gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING)).unwrap_or(0);
+    let Ok(texture) = gl.create_texture() else {
+      return;
+    };
+    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.tex_image_2d(
+      glow::TEXTURE_2D,
+      0,
+      glow::RGBA8 as i32,
+      w,
+      h,
+      0,
+      glow::RGBA,
+      glow::UNSIGNED_BYTE,
+      glow::PixelUnpackData::Slice(Some(image.as_raw())),
+    );
+    if let Ok(source) = gl.create_framebuffer() {
+      gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source));
+      gl.framebuffer_texture_2d(
+        glow::READ_FRAMEBUFFER,
+        glow::COLOR_ATTACHMENT0,
+        glow::TEXTURE_2D,
+        Some(texture),
+        0,
+      );
+      gl.bind_framebuffer(
+        glow::DRAW_FRAMEBUFFER,
+        std::num::NonZeroU32::new(window_fbo).map(glow::NativeFramebuffer),
+      );
+      // Rows are top-first but a GL framebuffer's row 0 is the bottom: flip with an inverted
+      // destination (top edge first).
+      gl.blit_framebuffer(0, 0, w, h, dest_x, dest_top, dest_x + w, dest_top - h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+      gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+      gl.delete_framebuffer(source);
+    }
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.delete_texture(texture);
+  }
 }
 
 /// Owns a handle to the shared Servo engine, a rendering context, and one webview.

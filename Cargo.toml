@@ -47,6 +47,8 @@ tauri-runtime = "2.11.3"
 tauri-utils = "2.9.3"
 raw-window-handle = "0.6"
 euclid = "0.22"
+# Same major as libservo's own GL bindings (used to paint the dropdown overlay region).
+glow = "0.17"
 futures-channel = "0.3"
 keyboard-types = "0.8.3"
 percent-encoding = "2.3"
