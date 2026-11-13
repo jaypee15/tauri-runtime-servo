@@ -712,6 +712,20 @@ pub fn set_overlay_region(label: &str, rect: Option<(i32, i32, u32, u32)>) -> bo
   true
 }
 
+type DismissHandler = Arc<dyn Fn() + Send + Sync>;
+
+static OVERLAY_DISMISS_HANDLER: std::sync::Mutex<Option<DismissHandler>> = std::sync::Mutex::new(None);
+
+/// Registers a callback run (on the main thread) when the user presses the mouse outside an active
+/// overlay region, after the overlay has been cleared. The app uses it to close its dropdown: clicks
+/// on the page in front never reach the toolbar page that owns the dropdown. The callback must not
+/// call back into the webviews synchronously.
+pub fn set_overlay_dismiss_handler(handler: impl Fn() + Send + Sync + 'static) {
+  if let Ok(mut slot) = OVERLAY_DISMISS_HANDLER.lock() {
+    *slot = Some(Arc::new(handler));
+  }
+}
+
 /// Releases the shared engine at event-loop exit, once no webview remains. libservo cannot be
 /// re-initialized in the same process, so the engine is never dropped earlier.
 pub(crate) fn release_engine_if_idle() {
@@ -1385,6 +1399,7 @@ impl Embedder {
         let Some(point) = self.cursor_position.get() else {
           if *state == ElementState::Pressed {
             self.blur_webview();
+            self.dismiss_overlay();
           }
           self.servo.spin_event_loop();
           return;
@@ -1509,6 +1524,37 @@ impl Embedder {
   fn focus_webview(&self) {
     if !self.focused.replace(true) {
       self.webview.focus();
+    }
+  }
+
+  /// A mouse press landed outside this webview while it owns the window's overlay region: clear the
+  /// overlay, redraw, and tell the app (see `set_overlay_dismiss_handler`).
+  fn dismiss_overlay(&self) {
+    let RenderingTarget::Child {
+      window_id,
+      child_id,
+      parent_context,
+      ..
+    } = &self.target
+    else {
+      return;
+    };
+    let cleared = with_compositor(*window_id, |compositor| match compositor.overlay() {
+      Some(overlay) if overlay.id == *child_id => {
+        compositor.set_overlay(None);
+        true
+      }
+      _ => false,
+    })
+    .unwrap_or(false);
+    if !cleared {
+      return;
+    }
+    composite_children(*window_id, parent_context);
+    parent_context.present();
+    let handler = OVERLAY_DISMISS_HANDLER.lock().ok().and_then(|slot| slot.clone());
+    if let Some(handler) = handler {
+      handler();
     }
   }
 

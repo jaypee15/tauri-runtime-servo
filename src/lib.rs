@@ -105,7 +105,8 @@ type IpcHandler = dyn Fn(Request<String>) + 'static;
 mod monitor;
 pub mod servo;
 pub use servo::embedder::{
-  bring_to_front, compositor_child_count, live_webview_count, set_overlay_region,
+  bring_to_front, compositor_child_count, live_webview_count, set_overlay_dismiss_handler,
+  set_overlay_region,
 };
 pub use servo::{set_resource_filter, ResourceAction, ResourceFilter, ResourceRequestInfo};
 #[cfg(windows)]
