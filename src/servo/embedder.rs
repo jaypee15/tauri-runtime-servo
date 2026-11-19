@@ -226,6 +226,40 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
+  fn show_embedder_control(&self, _webview: ServoWebView, control: servo::EmbedderControl) {
+    // Only `<select>` pickers are shown (by the app, through `set_select_handler`). Every other
+    // control is dropped, which resolves it with its default, as before.
+    let servo::EmbedderControl::SelectElement(select) = control else {
+      return;
+    };
+    let rect = select.position();
+    let popup = SelectPopup {
+      label: self.label.clone(),
+      rect: (rect.min.x, rect.min.y, rect.width().max(0) as u32, rect.height().max(0) as u32),
+      items: flatten_select_options(select.options()),
+      selected: select.selected_options(),
+      multiple: select.allow_select_multiple(),
+    };
+    // A newer picker replaces an older one; dropping the old one resolves it unchanged.
+    PENDING_SELECT.with(|p| *p.borrow_mut() = Some(select));
+    notify_select(SelectEvent::Show(popup));
+  }
+
+  fn hide_embedder_control(&self, _webview: ServoWebView, control_id: servo::EmbedderControlId) {
+    let was_pending = PENDING_SELECT.with(|p| {
+      let mut slot = p.borrow_mut();
+      if slot.as_ref().is_some_and(|s| s.id() == control_id) {
+        slot.take();
+        true
+      } else {
+        false
+      }
+    });
+    if was_pending {
+      notify_select(SelectEvent::Hide);
+    }
+  }
+
   fn notify_page_title_changed(&self, _webview: ServoWebView, title: Option<String>) {
     if let Some(handler) = &self.document_title_changed_handler {
       handler(title.unwrap_or_default());
@@ -290,6 +324,7 @@ impl WebViewDelegate for Delegate {
   }
 
   fn notify_closed(&self, _webview: ServoWebView) {
+    BY_LABEL.with(|m| m.borrow_mut().remove(&self.label));
     self.closed.set(true);
     self.waker.wake();
   }
@@ -709,6 +744,145 @@ pub fn set_overlay_region(label: &str, rect: Option<(i32, i32, u32, u32)>) -> bo
   };
   composite_children(window_id, &context);
   context.present();
+  true
+}
+
+/// One row of a `<select>` popup: an option, or a non-selectable group heading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectItem {
+  /// Pass this back in `submit_select`/`update_select` to choose the option.
+  pub id: usize,
+  pub label: String,
+  pub disabled: bool,
+  /// True for an `<optgroup>` heading.
+  pub group: bool,
+  /// True for an option inside an `<optgroup>`.
+  pub indented: bool,
+}
+
+/// A `<select>` the page opened, for the app to draw.
+#[derive(Clone, Debug)]
+pub struct SelectPopup {
+  /// Tauri label of the webview that owns the `<select>`.
+  pub label: String,
+  /// The `<select>` element's box `(x, y, width, height)` in that webview's pixels.
+  pub rect: (i32, i32, u32, u32),
+  pub items: Vec<SelectItem>,
+  /// Ids of the options selected now.
+  pub selected: Vec<usize>,
+  pub multiple: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum SelectEvent {
+  Show(SelectPopup),
+  /// The page closed the picker itself (navigation, element removed, ...).
+  Hide,
+}
+
+/// Flattens options and `<optgroup>`s into popup rows (pure, tested).
+pub(crate) fn flatten_select_options(options: &[servo::SelectElementOptionOrOptgroup]) -> Vec<SelectItem> {
+  let mut out = Vec::new();
+  for entry in options {
+    match entry {
+      servo::SelectElementOptionOrOptgroup::Option(o) => out.push(SelectItem {
+        id: o.id,
+        label: o.label.clone(),
+        disabled: o.is_disabled,
+        group: false,
+        indented: false,
+      }),
+      servo::SelectElementOptionOrOptgroup::Optgroup { label, options } => {
+        out.push(SelectItem { id: usize::MAX, label: label.clone(), disabled: true, group: true, indented: false });
+        for o in options {
+          out.push(SelectItem { id: o.id, label: o.label.clone(), disabled: o.is_disabled, group: false, indented: true });
+        }
+      }
+    }
+  }
+  out
+}
+
+type SelectHandler = Arc<dyn Fn(SelectEvent) + Send + Sync>;
+
+static SELECT_HANDLER: std::sync::Mutex<Option<SelectHandler>> = std::sync::Mutex::new(None);
+
+thread_local! {
+  /// The `<select>` picker waiting for the app's answer (main thread only).
+  static PENDING_SELECT: RefCell<Option<servo::SelectElement>> = const { RefCell::new(None) };
+}
+
+fn notify_select(event: SelectEvent) {
+  let handler = SELECT_HANDLER.lock().ok().and_then(|h| h.clone());
+  if let Some(handler) = handler {
+    handler(event);
+  }
+}
+
+/// Registers the callback that draws `<select>` popups. It runs on the main thread inside the
+/// engine's callbacks, so it must not call back into the webviews synchronously. Without a
+/// handler, a `<select>` does nothing when clicked.
+pub fn set_select_handler(handler: impl Fn(SelectEvent) + Send + Sync + 'static) {
+  if let Ok(mut slot) = SELECT_HANDLER.lock() {
+    *slot = Some(Arc::new(handler));
+  }
+}
+
+/// Changes the pending `<select>`'s selection without closing it (for multi-selects). Main thread.
+pub fn update_select(selected: Vec<usize>) {
+  PENDING_SELECT.with(|p| {
+    if let Some(select) = p.borrow_mut().as_mut() {
+      select.select(selected);
+    }
+  });
+}
+
+/// Applies `selected` to the pending `<select>` and closes it. Main thread.
+pub fn submit_select(selected: Vec<usize>) {
+  if let Some(mut select) = PENDING_SELECT.with(|p| p.borrow_mut().take()) {
+    select.select(selected);
+    select.submit();
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+/// Closes the pending `<select>` keeping whatever was last selected. Main thread.
+pub fn cancel_select() {
+  PENDING_SELECT.with(|p| p.borrow_mut().take());
+  with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+fn with_shared_servo(f: impl FnOnce(&Servo)) {
+  SHARED_SERVO.with(|cell| {
+    if let Some(servo) = cell.borrow().as_ref() {
+      f(servo);
+    }
+  });
+}
+
+thread_local! {
+  /// Live webviews by Tauri label, for `inject_click`.
+  static BY_LABEL: RefCell<HashMap<String, ServoWebView>> = RefCell::new(HashMap::new());
+}
+
+/// Sends a trusted mouse click to the webview with this label at `(x, y)` (that webview's own
+/// pixels), through the same engine input path as a real click. For automated tests: scripted
+/// `element.click()` is not trusted and skips parts of the engine (such as `<select>` pickers).
+/// Main thread. Returns whether the webview exists.
+pub fn inject_click(label: &str, x: f32, y: f32) -> bool {
+  let Some(webview) = BY_LABEL.with(|m| m.borrow().get(label).cloned()) else {
+    return false;
+  };
+  let point = DevicePoint::new(x, y);
+  webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point.into())));
+  for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+      action,
+      servo::MouseButton::Left,
+      point.into(),
+    )));
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
   true
 }
 
@@ -1226,6 +1400,7 @@ impl Embedder {
 
     servo.spin_event_loop();
 
+    BY_LABEL.with(|m| m.borrow_mut().insert(delegate.label.clone(), webview.clone()));
     LIVE.with(|live| live.borrow_mut().acquire());
     Ok(Self {
       servo,
@@ -1792,5 +1967,28 @@ mod tests {
       assert!(url::Url::parse(&uri).is_ok(), "{url:?} -> {uri} must parse as an absolute URL");
       assert!(uri.starts_with("http://"), "{url:?} -> {uri} must be attributed to a remote origin");
     }
+  }
+}
+
+#[cfg(test)]
+mod select_tests {
+  use super::*;
+  use servo::{SelectElementOption, SelectElementOptionOrOptgroup as E};
+
+  fn opt(id: usize, label: &str, disabled: bool) -> SelectElementOption {
+    SelectElementOption { id, label: label.into(), is_disabled: disabled }
+  }
+
+  #[test]
+  fn options_and_groups_flatten_into_rows() {
+    let rows = flatten_select_options(&[
+      E::Option(opt(0, "One", false)),
+      E::Optgroup { label: "Group".into(), options: vec![opt(1, "Two", false), opt(2, "Three", true)] },
+    ]);
+    assert_eq!(rows.len(), 4);
+    assert!(!rows[0].group && !rows[0].indented && rows[0].id == 0);
+    assert!(rows[1].group && rows[1].disabled && rows[1].label == "Group");
+    assert!(rows[2].indented && rows[2].id == 1);
+    assert!(rows[3].disabled && rows[3].id == 2);
   }
 }
