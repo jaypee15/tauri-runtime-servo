@@ -227,36 +227,77 @@ impl Delegate {
 
 impl WebViewDelegate for Delegate {
   fn show_embedder_control(&self, _webview: ServoWebView, control: servo::EmbedderControl) {
-    // Only `<select>` pickers are shown (by the app, through `set_select_handler`). Every other
-    // control is dropped, which resolves it with its default, as before.
-    let servo::EmbedderControl::SelectElement(select) = control else {
-      return;
-    };
-    let rect = select.position();
-    let popup = SelectPopup {
-      label: self.label.clone(),
-      rect: (rect.min.x, rect.min.y, rect.width().max(0) as u32, rect.height().max(0) as u32),
-      items: flatten_select_options(select.options()),
-      selected: select.selected_options(),
-      multiple: select.allow_select_multiple(),
-    };
-    // A newer picker replaces an older one; dropping the old one resolves it unchanged.
-    PENDING_SELECT.with(|p| *p.borrow_mut() = Some(select));
-    notify_select(SelectEvent::Show(popup));
+    use servo::EmbedderControl as C;
+    let px = |r: servo::DeviceIntRect| (r.min.x, r.min.y, r.width().max(0) as u32, r.height().max(0) as u32);
+    match control {
+      C::SelectElement(select) => {
+        let popup = SelectPopup {
+          label: self.label.clone(),
+          rect: px(select.position()),
+          items: flatten_select_options(select.options()),
+          selected: select.selected_options(),
+          multiple: select.allow_select_multiple(),
+        };
+        // A newer picker replaces an older one; dropping the old one resolves it unchanged.
+        PENDING_SELECT.with(|p| *p.borrow_mut() = Some(select));
+        notify_select(SelectEvent::Show(popup));
+      }
+      C::ColorPicker(picker) => {
+        let popup = ColorPopup {
+          label: self.label.clone(),
+          rect: px(picker.position()),
+          current: picker.current_color().map(|c| (c.red, c.green, c.blue)),
+        };
+        PENDING_COLOR.with(|p| *p.borrow_mut() = Some(picker));
+        notify_control(ControlEvent::Color(popup));
+      }
+      C::FilePicker(picker) => {
+        let popup = FilePopup {
+          label: self.label.clone(),
+          patterns: picker.filter_patterns().iter().map(|f| f.0.clone()).collect(),
+          multiple: picker.allow_select_multiple(),
+          current: picker.current_paths().to_vec(),
+        };
+        PENDING_FILE.with(|p| *p.borrow_mut() = Some(picker));
+        notify_control(ControlEvent::File(popup));
+      }
+      C::SimpleDialog(dialog) => {
+        let (kind, default) = match &dialog {
+          servo::SimpleDialog::Alert(_) => (DialogKind::Alert, String::new()),
+          servo::SimpleDialog::Confirm(_) => (DialogKind::Confirm, String::new()),
+          servo::SimpleDialog::Prompt(p) => (DialogKind::Prompt, p.current_value().to_string()),
+        };
+        let popup = DialogPopup { label: self.label.clone(), kind, message: dialog.message().to_string(), default };
+        PENDING_DIALOG.with(|p| *p.borrow_mut() = Some(dialog));
+        notify_control(ControlEvent::Dialog(popup));
+      }
+      // Context menus and input-method requests keep the engine's default (dropped).
+      _ => {}
+    }
   }
 
   fn hide_embedder_control(&self, _webview: ServoWebView, control_id: servo::EmbedderControlId) {
-    let was_pending = PENDING_SELECT.with(|p| {
+    let select = PENDING_SELECT.with(|p| {
       let mut slot = p.borrow_mut();
-      if slot.as_ref().is_some_and(|s| s.id() == control_id) {
-        slot.take();
-        true
-      } else {
-        false
-      }
+      if slot.as_ref().is_some_and(|s| s.id() == control_id) { slot.take(); true } else { false }
     });
-    if was_pending {
+    if select {
       notify_select(SelectEvent::Hide);
+    }
+    let color = PENDING_COLOR.with(|p| {
+      let mut slot = p.borrow_mut();
+      if slot.as_ref().is_some_and(|c| c.id() == control_id) { slot.take(); true } else { false }
+    });
+    let file = PENDING_FILE.with(|p| {
+      let mut slot = p.borrow_mut();
+      if slot.as_ref().is_some_and(|f| f.id() == control_id) { slot.take(); true } else { false }
+    });
+    // A dialog resolved by the page (navigation) closes its box too. A dialog's id is not
+    // readable, but a dialog is modal, so a hide that matched nothing else is for it.
+    let dialog = !(select || color || file)
+      && PENDING_DIALOG.with(|p| p.borrow_mut().take().is_some());
+    if color || file || dialog {
+      notify_control(ControlEvent::Hide);
     }
   }
 
@@ -850,6 +891,163 @@ pub fn submit_select(selected: Vec<usize>) {
 pub fn cancel_select() {
   PENDING_SELECT.with(|p| p.borrow_mut().take());
   with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+/// A colour picker (`<input type=color>`) for the app to draw.
+#[derive(Clone, Debug)]
+pub struct ColorPopup {
+  pub label: String,
+  /// The input's box `(x, y, width, height)` in that webview's page pixels.
+  pub rect: (i32, i32, u32, u32),
+  pub current: Option<(u8, u8, u8)>,
+}
+
+/// A file chooser (`<input type=file>`): the app shows its native dialog.
+#[derive(Clone, Debug)]
+pub struct FilePopup {
+  pub label: String,
+  /// Allowed extensions without the dot, or empty for any file.
+  pub patterns: Vec<String>,
+  pub multiple: bool,
+  pub current: Vec<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DialogKind {
+  Alert,
+  Confirm,
+  Prompt,
+}
+
+/// A script dialog: `alert()`, `confirm()` or `prompt()`. The page waits until it is answered.
+#[derive(Clone, Debug)]
+pub struct DialogPopup {
+  pub label: String,
+  pub kind: DialogKind,
+  pub message: String,
+  /// The prompt's default text (empty for the others).
+  pub default: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum ControlEvent {
+  Color(ColorPopup),
+  File(FilePopup),
+  Dialog(DialogPopup),
+  /// A navigation key pressed while a popup is open: "ArrowUp", "ArrowDown", "Home", "End",
+  /// "Enter" or "Escape". The engine does not pass these on to the page.
+  Key(&'static str),
+  /// The page resolved a colour picker, file chooser or dialog by itself.
+  Hide,
+}
+
+type ControlHandler = Arc<dyn Fn(ControlEvent) + Send + Sync>;
+
+static CONTROL_HANDLER: std::sync::Mutex<Option<ControlHandler>> = std::sync::Mutex::new(None);
+
+thread_local! {
+  static PENDING_COLOR: RefCell<Option<servo::ColorPicker>> = const { RefCell::new(None) };
+  static PENDING_FILE: RefCell<Option<servo::FilePicker>> = const { RefCell::new(None) };
+  static PENDING_DIALOG: RefCell<Option<servo::SimpleDialog>> = const { RefCell::new(None) };
+}
+
+fn notify_control(event: ControlEvent) {
+  let handler = CONTROL_HANDLER.lock().ok().and_then(|h| h.clone());
+  if let Some(handler) = handler {
+    handler(event);
+  }
+}
+
+/// Registers the callback for colour pickers, file choosers, script dialogs and popup keys. Runs
+/// on the main thread inside the engine's callbacks (do not call into the webviews from it).
+/// Without it those controls keep the engine's defaults.
+pub fn set_control_handler(handler: impl Fn(ControlEvent) + Send + Sync + 'static) {
+  if let Ok(mut slot) = CONTROL_HANDLER.lock() {
+    *slot = Some(Arc::new(handler));
+  }
+}
+
+/// Answers the pending colour picker with `color` (None keeps the page's value). Main thread.
+pub fn submit_color(color: Option<(u8, u8, u8)>) {
+  if let Some(mut picker) = PENDING_COLOR.with(|p| p.borrow_mut().take()) {
+    if let Some((red, green, blue)) = color {
+      picker.select(Some(servo::RgbColor { red, green, blue }));
+    }
+    picker.submit();
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+/// Answers the pending file chooser: `Some(paths)` attaches them, `None` cancels. Main thread.
+pub fn submit_files(paths: Option<Vec<std::path::PathBuf>>) {
+  if let Some(mut picker) = PENDING_FILE.with(|p| p.borrow_mut().take()) {
+    match paths {
+      Some(paths) => {
+        picker.select(&paths);
+        picker.submit();
+      }
+      None => picker.dismiss(),
+    }
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+/// Answers the pending script dialog. `accept` is OK (true) or Cancel (false); `text` is the
+/// prompt's answer. Main thread.
+pub fn answer_dialog(accept: bool, text: Option<String>) {
+  if let Some(dialog) = PENDING_DIALOG.with(|p| p.borrow_mut().take()) {
+    match dialog {
+      servo::SimpleDialog::Prompt(mut prompt) => {
+        if accept {
+          if let Some(text) = text {
+            prompt.set_current_value(&text);
+          }
+          prompt.confirm();
+        } else {
+          prompt.dismiss();
+        }
+      }
+      other => {
+        if accept {
+          other.confirm();
+        } else {
+          other.dismiss();
+        }
+      }
+    }
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+/// True while any popup (select list, colour picker, file chooser or dialog) waits for an answer.
+pub fn popup_pending() -> bool {
+  PENDING_SELECT.with(|p| p.borrow().is_some())
+    || PENDING_COLOR.with(|p| p.borrow().is_some())
+    || PENDING_FILE.with(|p| p.borrow().is_some())
+    || PENDING_DIALOG.with(|p| p.borrow().is_some())
+}
+
+/// Name of a key that drives popups, or None for every other key.
+pub(crate) fn popup_key_name(key: &TaoKey<'_>) -> Option<&'static str> {
+  match key {
+    TaoKey::ArrowUp => Some("ArrowUp"),
+    TaoKey::ArrowDown => Some("ArrowDown"),
+    TaoKey::Home => Some("Home"),
+    TaoKey::End => Some("End"),
+    TaoKey::Enter => Some("Enter"),
+    TaoKey::Escape => Some("Escape"),
+    _ => None,
+  }
+}
+
+/// Sends a popup key to the app. For automated tests (the window-event path calls the same code).
+/// Main thread. Returns whether a popup was waiting.
+pub fn inject_popup_key(name: &'static str) -> bool {
+  if !popup_pending() {
+    return false;
+  }
+  notify_control(ControlEvent::Key(name));
+  true
 }
 
 fn with_shared_servo(f: impl FnOnce(&Servo)) {
@@ -1495,6 +1693,16 @@ impl Embedder {
         self.modifiers.set(servo_modifiers(*modifiers));
       }
       WindowEvent::KeyboardInput { event, .. } if self.focused.get() => {
+        // While a popup is open its navigation keys go to the app, not the page.
+        if popup_pending() {
+          if let Some(name) = popup_key_name(&event.logical_key) {
+            if event.state == ElementState::Pressed && !event.repeat {
+              notify_control(ControlEvent::Key(name));
+            }
+            self.servo.spin_event_loop();
+            return;
+          }
+        }
         let state = match event.state {
           ElementState::Pressed => KeyState::Down,
           ElementState::Released => KeyState::Up,
@@ -1990,5 +2198,19 @@ mod select_tests {
     assert!(rows[1].group && rows[1].disabled && rows[1].label == "Group");
     assert!(rows[2].indented && rows[2].id == 1);
     assert!(rows[3].disabled && rows[3].id == 2);
+  }
+}
+
+#[cfg(test)]
+mod popup_key_tests {
+  use super::*;
+
+  #[test]
+  fn only_navigation_keys_drive_popups() {
+    assert_eq!(popup_key_name(&TaoKey::ArrowDown), Some("ArrowDown"));
+    assert_eq!(popup_key_name(&TaoKey::Enter), Some("Enter"));
+    assert_eq!(popup_key_name(&TaoKey::Escape), Some("Escape"));
+    assert_eq!(popup_key_name(&TaoKey::Character("a")), None);
+    assert_eq!(popup_key_name(&TaoKey::Space), None);
   }
 }
