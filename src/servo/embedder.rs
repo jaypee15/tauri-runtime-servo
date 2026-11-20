@@ -228,6 +228,7 @@ impl Delegate {
 impl WebViewDelegate for Delegate {
   fn show_embedder_control(&self, _webview: ServoWebView, control: servo::EmbedderControl) {
     use servo::EmbedderControl as C;
+    let control_id = control.id();
     let px = |r: servo::DeviceIntRect| (r.min.x, r.min.y, r.width().max(0) as u32, r.height().max(0) as u32);
     match control {
       C::SelectElement(select) => {
@@ -268,7 +269,7 @@ impl WebViewDelegate for Delegate {
           servo::SimpleDialog::Prompt(p) => (DialogKind::Prompt, p.current_value().to_string()),
         };
         let popup = DialogPopup { label: self.label.clone(), kind, message: dialog.message().to_string(), default };
-        PENDING_DIALOG.with(|p| *p.borrow_mut() = Some(dialog));
+        PENDING_DIALOG.with(|p| *p.borrow_mut() = Some((dialog, control_id)));
         notify_control(ControlEvent::Dialog(popup));
       }
       // Context menus and input-method requests keep the engine's default (dropped).
@@ -292,10 +293,12 @@ impl WebViewDelegate for Delegate {
       let mut slot = p.borrow_mut();
       if slot.as_ref().is_some_and(|f| f.id() == control_id) { slot.take(); true } else { false }
     });
-    // A dialog resolved by the page (navigation) closes its box too. A dialog's id is not
-    // readable, but a dialog is modal, so a hide that matched nothing else is for it.
-    let dialog = !(select || color || file)
-      && PENDING_DIALOG.with(|p| p.borrow_mut().take().is_some());
+    // A dialog resolved by the page (navigation) closes its box too. Match by id: the engine can
+    // report the previous dialog hidden after the next one has already appeared.
+    let dialog = PENDING_DIALOG.with(|p| {
+      let mut slot = p.borrow_mut();
+      if slot.as_ref().is_some_and(|(_, id)| *id == control_id) { slot.take(); true } else { false }
+    });
     if color || file || dialog {
       notify_control(ControlEvent::Hide);
     }
@@ -948,7 +951,7 @@ static CONTROL_HANDLER: std::sync::Mutex<Option<ControlHandler>> = std::sync::Mu
 thread_local! {
   static PENDING_COLOR: RefCell<Option<(servo::ColorPicker, String)>> = const { RefCell::new(None) };
   static PENDING_FILE: RefCell<Option<servo::FilePicker>> = const { RefCell::new(None) };
-  static PENDING_DIALOG: RefCell<Option<servo::SimpleDialog>> = const { RefCell::new(None) };
+  static PENDING_DIALOG: RefCell<Option<(servo::SimpleDialog, servo::EmbedderControlId)>> = const { RefCell::new(None) };
 }
 
 fn notify_control(event: ControlEvent) {
@@ -1008,7 +1011,7 @@ pub fn submit_files(paths: Option<Vec<std::path::PathBuf>>) {
 /// Answers the pending script dialog. `accept` is OK (true) or Cancel (false); `text` is the
 /// prompt's answer. Main thread.
 pub fn answer_dialog(accept: bool, text: Option<String>) {
-  if let Some(dialog) = PENDING_DIALOG.with(|p| p.borrow_mut().take()) {
+  if let Some((dialog, _)) = PENDING_DIALOG.with(|p| p.borrow_mut().take()) {
     match dialog {
       servo::SimpleDialog::Prompt(mut prompt) => {
         if accept {
