@@ -248,7 +248,7 @@ impl WebViewDelegate for Delegate {
           rect: px(picker.position()),
           current: picker.current_color().map(|c| (c.red, c.green, c.blue)),
         };
-        PENDING_COLOR.with(|p| *p.borrow_mut() = Some(picker));
+        PENDING_COLOR.with(|p| *p.borrow_mut() = Some((picker, self.label.clone())));
         notify_control(ControlEvent::Color(popup));
       }
       C::FilePicker(picker) => {
@@ -286,7 +286,7 @@ impl WebViewDelegate for Delegate {
     }
     let color = PENDING_COLOR.with(|p| {
       let mut slot = p.borrow_mut();
-      if slot.as_ref().is_some_and(|c| c.id() == control_id) { slot.take(); true } else { false }
+      if slot.as_ref().is_some_and(|(c, _)| c.id() == control_id) { slot.take(); true } else { false }
     });
     let file = PENDING_FILE.with(|p| {
       let mut slot = p.borrow_mut();
@@ -946,7 +946,7 @@ type ControlHandler = Arc<dyn Fn(ControlEvent) + Send + Sync>;
 static CONTROL_HANDLER: std::sync::Mutex<Option<ControlHandler>> = std::sync::Mutex::new(None);
 
 thread_local! {
-  static PENDING_COLOR: RefCell<Option<servo::ColorPicker>> = const { RefCell::new(None) };
+  static PENDING_COLOR: RefCell<Option<(servo::ColorPicker, String)>> = const { RefCell::new(None) };
   static PENDING_FILE: RefCell<Option<servo::FilePicker>> = const { RefCell::new(None) };
   static PENDING_DIALOG: RefCell<Option<servo::SimpleDialog>> = const { RefCell::new(None) };
 }
@@ -969,14 +969,27 @@ pub fn set_control_handler(handler: impl Fn(ControlEvent) + Send + Sync + 'stati
 
 /// Answers the pending colour picker with `color` (None keeps the page's value). Main thread.
 pub fn submit_color(color: Option<(u8, u8, u8)>) {
-  if let Some(mut picker) = PENDING_COLOR.with(|p| p.borrow_mut().take()) {
+  if let Some((mut picker, label)) = PENDING_COLOR.with(|p| p.borrow_mut().take()) {
+    let chose = color.is_some();
     if let Some((red, green, blue)) = color {
       picker.select(Some(servo::RgbColor { red, green, blue }));
     }
     picker.submit();
+    // The engine sets the input's value but fires no events, and pages listen for them. Fire the
+    // same `input` and `change` a native picker would, on the colour input that was clicked.
+    if chose {
+      if let Some(webview) = BY_LABEL.with(|m| m.borrow().get(&label).cloned()) {
+        webview.evaluate_javascript(COLOR_EVENTS_JS, |_| {});
+      }
+    }
   }
   with_shared_servo(|servo| servo.spin_event_loop());
 }
+
+const COLOR_EVENTS_JS: &str = "(function(){var e=document.activeElement;\
+if(e&&e.tagName==='INPUT'&&e.type==='color'){\
+e.dispatchEvent(new Event('input',{bubbles:true}));\
+e.dispatchEvent(new Event('change',{bubbles:true}));}})()";
 
 /// Answers the pending file chooser: `Some(paths)` attaches them, `None` cancels. Main thread.
 pub fn submit_files(paths: Option<Vec<std::path::PathBuf>>) {
