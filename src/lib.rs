@@ -105,10 +105,10 @@ type IpcHandler = dyn Fn(Request<String>) + 'static;
 mod monitor;
 pub mod servo;
 pub use servo::embedder::{
-  answer_dialog, bring_to_front, cancel_select, compositor_child_count, inject_click,
-  inject_popup_key, live_webview_count, popup_pending, set_control_handler,
+  answer_dialog, answer_menu, bring_to_front, cancel_select, compositor_child_count, inject_click,
+  inject_popup_key, inject_right_click, submit_date, live_webview_count, popup_pending, set_control_handler,
   set_overlay_dismiss_handler, set_overlay_region, set_select_handler, submit_color, submit_files,
-  submit_select, update_select, ColorPopup, ControlEvent, DialogKind, DialogPopup, FilePopup,
+  submit_select, update_select, ColorPopup, ControlEvent, DatePopup, DialogKind, DialogPopup, FilePopup, MenuEntry, MenuPopup,
   SelectEvent, SelectItem, SelectPopup,
 };
 pub use servo::{set_resource_filter, ResourceAction, ResourceFilter, ResourceRequestInfo};

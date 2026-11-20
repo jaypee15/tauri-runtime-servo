@@ -226,7 +226,7 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
-  fn show_embedder_control(&self, _webview: ServoWebView, control: servo::EmbedderControl) {
+  fn show_embedder_control(&self, webview: ServoWebView, control: servo::EmbedderControl) {
     use servo::EmbedderControl as C;
     let control_id = control.id();
     let px = |r: servo::DeviceIntRect| (r.min.x, r.min.y, r.width().max(0) as u32, r.height().max(0) as u32);
@@ -272,8 +272,39 @@ impl WebViewDelegate for Delegate {
         PENDING_DIALOG.with(|p| *p.borrow_mut() = Some((dialog, control_id)));
         notify_control(ControlEvent::Dialog(popup));
       }
-      // Context menus and input-method requests keep the engine's default (dropped).
-      _ => {}
+      C::InputMethod(ime) => {
+        // Only the date and time kinds get a picker; text fields keep the engine's default.
+        let kind = match ime.input_method_type() {
+          servo::InputMethodType::Date => "date",
+          servo::InputMethodType::DatetimeLocal => "datetime-local",
+          servo::InputMethodType::Month => "month",
+          servo::InputMethodType::Time => "time",
+          servo::InputMethodType::Week => "week",
+          _ => return,
+        };
+        let popup = DatePopup { label: self.label.clone(), rect: px(ime.position()), kind, value: ime.text() };
+        // Remember which input asked: the picker is drawn by another page, and the page's focus may
+        // move before the answer comes back.
+        webview.evaluate_javascript("window.__bifrostDateTarget=document.activeElement", |_| {});
+        PENDING_DATE.with(|p| *p.borrow_mut() = Some((self.label.clone(), control_id)));
+        notify_control(ControlEvent::Date(popup));
+      }
+      C::ContextMenu(menu) => {
+        let items = menu
+          .items()
+          .iter()
+          .map(|item| match item {
+            servo::ContextMenuItem::Item { label, enabled, .. } => {
+              MenuEntry::Item { label: label.replace(" in New View", " in New Tab"), enabled: *enabled }
+            }
+            servo::ContextMenuItem::Separator => MenuEntry::Separator,
+          })
+          .collect();
+        let (x, y) = LAST_CURSOR.with(|c| c.get());
+        let popup = MenuPopup { label: self.label.clone(), x, y, items };
+        PENDING_MENU.with(|p| *p.borrow_mut() = Some(menu));
+        notify_control(ControlEvent::Menu(popup));
+      }
     }
   }
 
@@ -299,7 +330,15 @@ impl WebViewDelegate for Delegate {
       let mut slot = p.borrow_mut();
       if slot.as_ref().is_some_and(|(_, id)| *id == control_id) { slot.take(); true } else { false }
     });
-    if color || file || dialog {
+    let date = PENDING_DATE.with(|p| {
+      let mut slot = p.borrow_mut();
+      if slot.as_ref().is_some_and(|(_, id)| *id == control_id) { slot.take(); true } else { false }
+    });
+    let menu = PENDING_MENU.with(|p| {
+      let mut slot = p.borrow_mut();
+      if slot.as_ref().is_some_and(|m| m.id() == control_id) { slot.take(); true } else { false }
+    });
+    if color || file || dialog || date || menu {
       notify_control(ControlEvent::Hide);
     }
   }
@@ -896,6 +935,34 @@ pub fn cancel_select() {
   with_shared_servo(|servo| servo.spin_event_loop());
 }
 
+/// A date or time input (`date`, `datetime-local`, `month`, `time`, `week`) for the app to draw.
+#[derive(Clone, Debug)]
+pub struct DatePopup {
+  pub label: String,
+  /// The input's box `(x, y, width, height)` in that webview's page pixels.
+  pub rect: (i32, i32, u32, u32),
+  pub kind: &'static str,
+  /// The input's current value in HTML's own format ("2026-11-20", "14:30", ...); may be empty.
+  pub value: String,
+}
+
+/// One row of a right-click menu.
+#[derive(Clone, Debug)]
+pub enum MenuEntry {
+  Item { label: String, enabled: bool },
+  Separator,
+}
+
+/// A right-click menu for the app to draw at the pointer.
+#[derive(Clone, Debug)]
+pub struct MenuPopup {
+  pub label: String,
+  /// Where the pointer was, in device pixels of that webview.
+  pub x: f32,
+  pub y: f32,
+  pub items: Vec<MenuEntry>,
+}
+
 /// A colour picker (`<input type=color>`) for the app to draw.
 #[derive(Clone, Debug)]
 pub struct ColorPopup {
@@ -934,6 +1001,8 @@ pub struct DialogPopup {
 
 #[derive(Clone, Debug)]
 pub enum ControlEvent {
+  Date(DatePopup),
+  Menu(MenuPopup),
   Color(ColorPopup),
   File(FilePopup),
   Dialog(DialogPopup),
@@ -950,6 +1019,10 @@ static CONTROL_HANDLER: std::sync::Mutex<Option<ControlHandler>> = std::sync::Mu
 
 thread_local! {
   static PENDING_COLOR: RefCell<Option<(servo::ColorPicker, String)>> = const { RefCell::new(None) };
+  static PENDING_DATE: RefCell<Option<(String, servo::EmbedderControlId)>> = const { RefCell::new(None) };
+  static PENDING_MENU: RefCell<Option<servo::ContextMenu>> = const { RefCell::new(None) };
+  /// The pointer's last position over any webview (device pixels), where a right-click menu opens.
+  static LAST_CURSOR: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0.0, 0.0)) };
   static PENDING_FILE: RefCell<Option<servo::FilePicker>> = const { RefCell::new(None) };
   static PENDING_DIALOG: RefCell<Option<(servo::SimpleDialog, servo::EmbedderControlId)>> = const { RefCell::new(None) };
 }
@@ -993,6 +1066,73 @@ const COLOR_EVENTS_JS: &str = "(function(){var e=document.activeElement;\
 if(e&&e.tagName==='INPUT'&&e.type==='color'){\
 e.dispatchEvent(new Event('input',{bubbles:true}));\
 e.dispatchEvent(new Event('change',{bubbles:true}));}})()";
+
+/// Answers the pending date or time picker with the new value in HTML's format, or None to leave
+/// the input alone. An empty string clears it. Main thread.
+pub fn submit_date(value: Option<String>) {
+  if let Some((label, _)) = PENDING_DATE.with(|p| p.borrow_mut().take()) {
+    if let Some(value) = value {
+      if let Some(webview) = BY_LABEL.with(|m| m.borrow().get(&label).cloned()) {
+        // Only the characters of an HTML date or time value are let through, so nothing in it can
+        // break out of the quotes.
+        let clean: String = value.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | 'T' | '.')).collect();
+        let quoted = format!("'{clean}'");
+        let js = format!(
+          "(function(){{var e=window.__bifrostDateTarget||document.activeElement;\
+if(e&&e.tagName==='INPUT'){{e.value={quoted};\
+e.dispatchEvent(new Event('input',{{bubbles:true}}));\
+e.dispatchEvent(new Event('change',{{bubbles:true}}));}}}})()"
+        );
+        webview.evaluate_javascript(js, |_| {});
+      }
+    }
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+}
+
+/// Answers the pending right-click menu with the row the user chose (an index into the rows sent),
+/// or None to dismiss it. Returns a URL the app should open in a new tab, for "Open Link/Image in
+/// New Tab": the app owns its tabs, so those two are not left to the engine. Main thread.
+pub fn answer_menu(index: Option<usize>) -> Option<String> {
+  let menu = PENDING_MENU.with(|p| p.borrow_mut().take())?;
+  let mut open = None;
+  match index.and_then(|i| menu.items().get(i).cloned()) {
+    Some(servo::ContextMenuItem::Item { action, enabled: true, .. }) => match action {
+      servo::ContextMenuAction::OpenLinkInNewWebView => {
+        open = menu.element_info().link_url.as_ref().map(|u| u.to_string());
+        menu.dismiss();
+      }
+      servo::ContextMenuAction::OpenImageInNewView => {
+        open = menu.element_info().image_url.as_ref().map(|u| u.to_string());
+        menu.dismiss();
+      }
+      action => menu.select(action),
+    },
+    _ => menu.dismiss(),
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+  open
+}
+
+/// Sends a trusted right-click at `(x, y)` (that webview's own pixels). For automated tests.
+/// Main thread. Returns whether the webview exists.
+pub fn inject_right_click(label: &str, x: f32, y: f32) -> bool {
+  let Some(webview) = BY_LABEL.with(|m| m.borrow().get(label).cloned()) else {
+    return false;
+  };
+  LAST_CURSOR.with(|c| c.set((x, y)));
+  let point = DevicePoint::new(x, y);
+  webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point.into())));
+  for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+      action,
+      servo::MouseButton::Right,
+      point.into(),
+    )));
+  }
+  with_shared_servo(|servo| servo.spin_event_loop());
+  true
+}
 
 /// Answers the pending file chooser: `Some(paths)` attaches them, `None` cancels. Main thread.
 pub fn submit_files(paths: Option<Vec<std::path::PathBuf>>) {
@@ -1041,6 +1181,8 @@ pub fn popup_pending() -> bool {
     || PENDING_COLOR.with(|p| p.borrow().is_some())
     || PENDING_FILE.with(|p| p.borrow().is_some())
     || PENDING_DIALOG.with(|p| p.borrow().is_some())
+    || PENDING_DATE.with(|p| p.borrow().is_some())
+    || PENDING_MENU.with(|p| p.borrow().is_some())
 }
 
 /// Name of a key that drives popups, or None for every other key.
@@ -1061,7 +1203,7 @@ pub(crate) fn popup_key_name(key: &TaoKey<'_>) -> Option<&'static str> {
 pub(crate) fn popup_wants_key(name: &str) -> bool {
   match name {
     "Enter" | "Escape" => popup_pending(),
-    _ => PENDING_SELECT.with(|p| p.borrow().is_some()),
+    _ => PENDING_SELECT.with(|p| p.borrow().is_some()) || PENDING_MENU.with(|p| p.borrow().is_some()),
   }
 }
 
@@ -1780,6 +1922,9 @@ impl Embedder {
         let previous_position = self.cursor_position.get();
         let position = self.target.webview_point(*position);
         self.cursor_position.set(position);
+        if let Some(p) = position {
+          LAST_CURSOR.with(|c| c.set((p.x, p.y)));
+        }
         match (previous_position, position) {
           (_, Some(point)) => {
             self
