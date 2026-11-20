@@ -1040,10 +1040,19 @@ pub(crate) fn popup_key_name(key: &TaoKey<'_>) -> Option<&'static str> {
   }
 }
 
+/// Whether the open popup (if any) takes this key. Enter and Escape go to any popup; the cursor
+/// keys only to a select list, because a colour picker's or dialog's text box needs them to edit.
+pub(crate) fn popup_wants_key(name: &str) -> bool {
+  match name {
+    "Enter" | "Escape" => popup_pending(),
+    _ => PENDING_SELECT.with(|p| p.borrow().is_some()),
+  }
+}
+
 /// Sends a popup key to the app. For automated tests (the window-event path calls the same code).
-/// Main thread. Returns whether a popup was waiting.
+/// Main thread. Returns whether a popup was waiting for that key.
 pub fn inject_popup_key(name: &'static str) -> bool {
-  if !popup_pending() {
+  if !popup_wants_key(name) {
     return false;
   }
   notify_control(ControlEvent::Key(name));
@@ -1694,8 +1703,8 @@ impl Embedder {
       }
       WindowEvent::KeyboardInput { event, .. } if self.focused.get() => {
         // While a popup is open its navigation keys go to the app, not the page.
-        if popup_pending() {
-          if let Some(name) = popup_key_name(&event.logical_key) {
+        if let Some(name) = popup_key_name(&event.logical_key).filter(|n| popup_wants_key(n)) {
+          {
             if event.state == ElementState::Pressed && !event.repeat {
               notify_control(ControlEvent::Key(name));
             }
